@@ -87,6 +87,8 @@ option(FLB_LUAJIT              "Enable Lua Scripting support" Yes)
 option(FLB_RECORD_ACCESSOR     "Enable record accessor"       Yes)
 option(FLB_SIGNV4              "Enable AWS Signv4 support"    Yes)
 option(FLB_AWS                "Enable AWS support"            Yes)
+option(FLB_SYSTEM_STRPTIME     "Use strptime in system libc"  Yes)
+option(FLB_MAXMINDDB           "Enable libmaxminddb"          Yes)
 option(FLB_STATIC_CONF         "Build binary using static configuration")
 option(FLB_STREAM_PROCESSOR    "Enable Stream Processor"      Yes)
 option(FLB_CORO_STACK_SIZE     "Set coroutine stack size")
@@ -192,6 +194,7 @@ option(FLB_FILTER_NEST        "Enable nest filter"                  Yes)
 option(FLB_FILTER_LUA         "Enable Lua scripting filter"         Yes)
 option(FLB_FILTER_RECORD_MODIFIER "Enable record_modifier filter"   Yes)
 option(FLB_FILTER_TENSORFLOW  "Enable tensorflow filter"             No)
+option(FLB_FILTER_GEOIP2      "Enable geoip2 filter"                Yes)
 
 # Debug callbacks
 option(FLB_HTTP_CLIENT_DEBUG  "Enable HTTP Client debug callbacks"   No)
@@ -699,6 +702,12 @@ if(FLB_INOTIFY)
   if(FLB_HAVE_INOTIFY)
     FLB_DEFINITION(FLB_HAVE_INOTIFY)
   endif()
+endif()
+
+# libmaxminddb
+if(FLB_MAXMINDDB)
+  include(cmake/libmaxminddb.cmake)
+  FLB_DEFINITION(FLB_HAVE_MAXMINDDB)
 endif()
 
 configure_file(
