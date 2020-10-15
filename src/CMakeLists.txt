@@ -165,13 +165,6 @@ if(FLB_LUAJIT)
     "libluajit")
 endif()
 
-if(FLB_MAXMINDDB)
-  set(extra_libs
-    ${extra_libs}
-    "libmaxminddb"
-    )
-endif()
-
 if(FLB_SQLDB)
   set(src
     ${src}
