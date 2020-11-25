@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,6 @@
 
 #include <monkey/mk_core.h>
 #include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_buffer.h>
 #include <fluent-bit/flb_input.h>
 
 /* Task status */
@@ -65,7 +65,7 @@ struct flb_task_route {
  * task data to the desired output path.
  */
 struct flb_task_retry {
-    int attemps;                        /* number of attemps, default 1 */
+    int attempts;                       /* number of attempts, default 1 */
     struct flb_output_instance *o_ins;  /* route that we are retrying   */
     struct flb_task *parent;            /* parent task reference        */
     struct mk_list _head;               /* link to parent task list     */
@@ -75,55 +75,56 @@ struct flb_task_retry {
 struct flb_task {
     int id;                             /* task id                   */
     uint64_t ref_id;                    /* external reference id     */
-    int status;                         /* new task or running ?     */
-    int mapped;                         /* is a mmap(2)ed file ?     */
-    int deleted;                        /* should be deleted ?       */
+    uint8_t status;                     /* new task or running ?     */
     int n_threads;                      /* number number of threads  */
     int users;                          /* number of users (threads) */
-    int destinations;                   /* number of output dests    */
-    char *tag;                          /* original tag              */
-    char *buf;                          /* buffer                    */
+    char *tag;                          /* record tag                */
+    int tag_len;                        /* tag length                */
+    const char *buf;                    /* buffer                    */
     size_t size;                        /* buffer data size          */
-#ifdef FLB_HAVE_BUFFERING
-    int worker_id;                      /* Buffer worker that owns this task */
-    int qchunk_id;                      /* qchunk id if it comes from buffer */
-    unsigned char hash_sha1[20];        /* SHA1(buf)                         */
-    char hash_hex[41];                  /* Hex string for hash_sha1          */
+    void *ic;                           /* input chunk */
+#ifdef FLB_HAVE_METRICS
+    int records;                        /* numbers of records in 'buf'   */
 #endif
-    struct flb_input_dyntag *dt;        /* dyntag node (if applies)      */
-    struct flb_input_instance *i_ins;   /* input instance                */
     struct mk_list threads;             /* ref flb_input_instance->tasks */
     struct mk_list routes;              /* routes to dispatch data       */
     struct mk_list retries;             /* queued in-memory retries      */
     struct mk_list _head;               /* link to input_instance        */
+    struct flb_input_instance *i_ins;   /* input instance                */
     struct flb_config *config;          /* parent flb config             */
-
-#ifdef FLB_HAVE_FLUSH_PTHREADS
-    pthread_mutex_t mutex_threads;
-#endif
 };
 
+int flb_task_running_count(struct flb_config *config);
+int flb_task_running_print(struct flb_config *config);
+
 struct flb_task *flb_task_create(uint64_t ref_id,
-                                 char *buf,
+                                 const char *buf,
                                  size_t size,
                                  struct flb_input_instance *i_ins,
-                                 struct flb_input_dyntag *dt,
-                                 char *tag,
-                                 struct flb_config *config);
-struct flb_task *flb_task_create_direct(uint64_t ref_id,
-                                        char *buf,
-                                        size_t size,
-                                        struct flb_input_instance *i_ins,
-                                        char *tag,
-                                        char *hash,
-                                        uint64_t routes,
-                                        struct flb_config *config);
+                                 void *ic,
+                                 const char *tag_buf, int tag_len,
+                                 struct flb_config *config,
+                                 int *err);
 
-void flb_task_destroy(struct flb_task *task);
+void flb_task_add_thread(struct flb_thread *thread,
+                         struct flb_task *task);
+
+void flb_task_destroy(struct flb_task *task, int del);
 
 struct flb_task_retry *flb_task_retry_create(struct flb_task *task,
                                              void *data);
 void flb_task_retry_destroy(struct flb_task_retry *retry);
+int flb_task_retry_reschedule(struct flb_task_retry *retry, struct flb_config *config);
+int flb_task_from_fs_storage(struct flb_task *task);
+int flb_task_retry_count(struct flb_task *task, void *data);
 int flb_task_retry_clean(struct flb_task *task, void *data);
 
+
+struct flb_task *flb_task_chunk_create(uint64_t ref_id,
+                                       const char *buf,
+                                       size_t size,
+                                       struct flb_input_instance *i_ins,
+                                       void *ic,
+                                       const char *tag_buf, int tag_len,
+                                       struct flb_config *config);
 #endif

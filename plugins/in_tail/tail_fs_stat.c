@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,16 +21,19 @@
 #define _DEFAULT_SOURCE
 
 #include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 
 #include "tail_file.h"
 #include "tail_db.h"
 #include "tail_config.h"
 #include "tail_signal.h"
+
+#ifdef FLB_SYSTEM_WINDOWS
+#include "win32.h"
+#endif
 
 struct fs_stat {
     /* last time check */
@@ -39,7 +43,7 @@ struct fs_stat {
     struct stat st;
 };
 
-static int tail_fs_event(struct flb_input_instance *i_ins,
+static int tail_fs_event(struct flb_input_instance *ins,
                          struct flb_config *config, void *in_context)
 {
     int ret;
@@ -78,11 +82,11 @@ static int tail_fs_event(struct flb_input_instance *i_ins,
     return 0;
 }
 
-static int tail_fs_check(struct flb_input_instance *i_ins,
+static int tail_fs_check(struct flb_input_instance *ins,
                          struct flb_config *config, void *in_context)
 {
     int ret;
-    off_t offset;
+    int64_t offset;
     char *name;
     struct mk_list *tmp;
     struct mk_list *head;
@@ -98,35 +102,23 @@ static int tail_fs_check(struct flb_input_instance *i_ins,
 
         ret = fstat(file->fd, &st);
         if (ret == -1) {
-            flb_debug("[in_tail] error stat(2) %s, removing", file->name);
+            flb_plg_debug(ctx->ins, "error stat(2) %s, removing", file->name);
             flb_tail_file_remove(file);
             continue;
         }
 
         /* Check if the file have been deleted */
         if (st.st_nlink == 0) {
-            flb_debug("[in_tail] deleted %s", file->name);
+            flb_plg_debug(ctx->ins, "file has been deleted: %s", file->name);
+#ifdef FLB_HAVE_SQLDB
+            if (ctx->db) {
+                /* Remove file entry from the database */
+                flb_tail_db_file_delete(file, ctx);
+            }
+#endif
             flb_tail_file_remove(file);
             continue;
         }
-
-        /* Discover the current file name for the open file descriptor */
-        name = flb_tail_file_name(file);
-        if (!name) {
-            flb_debug("[in_tail] could not resolve %s, removing", file->name);
-            flb_tail_file_remove(file);
-            continue;
-        }
-
-        /*
-         * Check if file still exists. This method requires explicity that the
-         * user is using an absolute path, otherwise we will be rotating the
-         * wrong file.
-         */
-        if (strcmp(name, file->name) != 0) {
-            flb_tail_file_rotated(file);
-        }
-        flb_free(name);
 
         /* Check if the file was truncated */
         if (file->offset > st.st_size) {
@@ -136,15 +128,17 @@ static int tail_fs_check(struct flb_input_instance *i_ins,
                 return -1;
             }
 
-            flb_debug("[in_tail] truncated %s", file->name);
+            flb_plg_debug(ctx->ins, "file truncated %s", file->name);
             file->offset = offset;
             file->buf_len = 0;
             memcpy(&fst->st, &st, sizeof(struct stat));
 
+#ifdef FLB_HAVE_SQLDB
             /* Update offset in database file */
             if (ctx->db) {
                 flb_tail_db_file_offset(file, ctx);
             }
+#endif
         }
 
         if (file->offset < st.st_size) {
@@ -154,6 +148,30 @@ static int tail_fs_check(struct flb_input_instance *i_ins,
         else {
             file->pending_bytes = 0;
         }
+
+
+        /* Discover the current file name for the open file descriptor */
+        name = flb_tail_file_name(file);
+        if (!name) {
+            flb_plg_debug(ctx->ins, "could not resolve %s, removing", file->name);
+            flb_tail_file_remove(file);
+            continue;
+        }
+
+        /*
+         * Check if file still exists. This method requires explicity that the
+         * user is using an absolute path, otherwise we will be rotating the
+         * wrong file.
+         *
+         * flb_tail_target_file_name_cmp is a deeper compare than
+         * flb_tail_file_name_cmp. If applicable, it compares to the underlying
+         * real_name of the file.
+         */
+        if (flb_tail_file_is_rotated(ctx, file) == FLB_TRUE) {
+            flb_tail_file_rotated(file);
+        }
+        flb_free(name);
+
     }
 
     return 0;
@@ -186,14 +204,14 @@ int flb_tail_fs_init(struct flb_input_instance *in,
 
 void flb_tail_fs_pause(struct flb_tail_config *ctx)
 {
-    flb_input_collector_pause(ctx->coll_fd_fs1, ctx->i_ins);
-    flb_input_collector_pause(ctx->coll_fd_fs2, ctx->i_ins);
+    flb_input_collector_pause(ctx->coll_fd_fs1, ctx->ins);
+    flb_input_collector_pause(ctx->coll_fd_fs2, ctx->ins);
 }
 
 void flb_tail_fs_resume(struct flb_tail_config *ctx)
 {
-    flb_input_collector_resume(ctx->coll_fd_fs1, ctx->i_ins);
-    flb_input_collector_resume(ctx->coll_fd_fs2, ctx->i_ins);
+    flb_input_collector_resume(ctx->coll_fd_fs1, ctx->ins);
+    flb_input_collector_resume(ctx->coll_fd_fs2, ctx->ins);
 }
 
 int flb_tail_fs_add(struct flb_tail_file *file)

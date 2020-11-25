@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,11 +25,10 @@
 #include <fcntl.h>
 
 #include <msgpack.h>
-#include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
-#include <fluent-bit/flb_stats.h>
 
 #include "syslog.h"
 #include "syslog_conf.h"
@@ -48,11 +48,11 @@ static int in_syslog_collect_tcp(struct flb_input_instance *i_ins,
     /* Accept the new connection */
     fd = flb_net_accept(ctx->server_fd);
     if (fd == -1) {
-        flb_error("[in_syslog] could not accept new connection");
+        flb_plg_error(ctx->ins, "could not accept new connection");
         return -1;
     }
 
-    flb_trace("[in_syslog] new Unix connection arrived FD=%i", fd);
+    flb_plg_debug(ctx->ins, "new Unix connection arrived FD=%i", fd);
     conn = syslog_conn_add(fd, ctx);
     if (!conn) {
         return -1;
@@ -66,21 +66,25 @@ static int in_syslog_collect_tcp(struct flb_input_instance *i_ins,
  * one syslog message and it should not exceed 1KB.
  */
 static int in_syslog_collect_udp(struct flb_input_instance *i_ins,
-                                 struct flb_config *config, void *in_context)
+                                 struct flb_config *config,
+                                 void *in_context)
 {
     int bytes;
-    char buf[1024];
     struct flb_syslog *ctx = in_context;
     (void) i_ins;
 
-    bytes = recvfrom(ctx->server_fd, buf, sizeof(buf) - 1, 0, NULL, NULL);
+    bytes = recvfrom(ctx->server_fd,
+                     ctx->buffer_data, ctx->buffer_size - 1, 0,
+                     NULL, NULL);
     if (bytes > 0) {
-        buf[bytes] = '\0';
-        syslog_prot_process_udp(buf, bytes, ctx);
+        ctx->buffer_data[bytes] = '\0';
+        ctx->buffer_len = bytes;
+        syslog_prot_process_udp(ctx->buffer_data, ctx->buffer_len, ctx);
     }
     else {
         flb_errno();
     }
+    ctx->buffer_len = 0;
 
     return 0;
 }
@@ -95,13 +99,13 @@ static int in_syslog_init(struct flb_input_instance *in,
     /* Allocate space for the configuration */
     ctx = syslog_conf_create(in, config);
     if (!ctx) {
-        flb_error("[in_syslog] could not initialize plugin");
+        flb_plg_error(in, "could not initialize plugin");
         return -1;
     }
 
     if ((ctx->mode == FLB_SYSLOG_UNIX_TCP || ctx->mode == FLB_SYSLOG_UNIX_UDP)
         && !ctx->unix_path) {
-        flb_error("[in_syslog] Unix path not defined");
+        flb_plg_error(ctx->ins, "Unix path not defined");
         syslog_conf_destroy(ctx);
         return -1;
     }
@@ -132,7 +136,7 @@ static int in_syslog_init(struct flb_input_instance *in,
     }
 
     if (ret == -1) {
-        flb_error("[in_syslog] Could not set collector");
+        flb_plg_error(ctx->ins, "Could not set collector");
         syslog_conf_destroy(ctx);
     }
 

@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +18,7 @@
  *  limitations under the License.
  */
 
+#include <fluent-bit/flb_compat.h>
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_input.h>
@@ -25,9 +27,11 @@
 #include <fluent-bit/flb_router.h>
 #include <fluent-bit/flb_version.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_kv.h>
 
-#include <unistd.h>
+#ifndef _MSC_VER
 #include <sys/utsname.h>
+#endif
 
 static void print_key(char *key)
 {
@@ -70,10 +74,6 @@ static void input_flags(int flags)
         printf("NET ");
     }
 
-    if (flags & FLB_INPUT_DYN_TAG) {
-        printf("DYN_TAG ");
-    }
-
     if (flags & FLB_INPUT_THREAD) {
         printf("THREAD ");
     }
@@ -100,13 +100,69 @@ static void print_host(struct flb_net_host *host)
 static void print_properties(struct mk_list *props)
 {
     struct mk_list *head;
-    struct flb_config_prop *p;
+    struct flb_kv *kv;
 
     mk_list_foreach(head, props) {
-        p = mk_list_entry(head, struct flb_config_prop, _head);
-        print_kv(p->key, p->val);
+        kv = mk_list_entry(head, struct flb_kv, _head);
+        print_kv(kv->key, kv->val);
     }
 }
+
+#ifdef _MSC_VER
+/* A definition table of SYSTEM_INFO.wProcessorArchitecture.
+ *
+ * This is a streight-forward translation of the official manual.
+ * https://docs.microsoft.com/en-us/windows/desktop/api/sysinfoapi/
+ */
+static const char* win32_arch(int archid)
+{
+    switch(archid)
+    {
+        case PROCESSOR_ARCHITECTURE_AMD64:
+            return "x64 (AMD or Intel)";
+        case PROCESSOR_ARCHITECTURE_ARM:
+            return "ARM";
+        case PROCESSOR_ARCHITECTURE_ARM64:
+            return "ARM64";
+        case PROCESSOR_ARCHITECTURE_IA64:
+            return "Intel Itanium-based";
+        case PROCESSOR_ARCHITECTURE_INTEL:
+            return "x86";
+        case PROCESSOR_ARCHITECTURE_UNKNOWN:
+        default:
+            return "unknown";
+    }
+}
+
+static void win32_operating_system_info()
+{
+    OSVERSIONINFOA win32os;
+
+    /* TODO Support "Application Manifest". Windows 10 reports a wrong
+     * version info if we do not manifest the supported OS.
+     * https://blogs.msdn.microsoft.com/chuckw/2013/09/10/manifest-madness/
+     */
+    win32os.dwOSVersionInfoSize = sizeof(OSVERSIONINFOA);
+    GetVersionExA(&win32os);
+
+    printf("[Operating System]\n");
+    printf("    Name\t\tWindows\n");
+    printf("    Version\t\t%i.%i\n", win32os.dwMajorVersion, win32os.dwMinorVersion);
+    printf("    Build\t\t%i\n", win32os.dwBuildNumber);
+    printf("\n");
+}
+
+static void win32_hardware_info()
+{
+    SYSTEM_INFO win32info;
+
+    GetNativeSystemInfo(&win32info);
+    printf("[Hardware]\n");
+    printf("    Architecture\t%s\n", win32_arch(win32info.wProcessorArchitecture));
+    printf("    Processors\t\t%i\n", win32info.dwNumberOfProcessors);
+    printf("\n");
+}
+#endif
 
 int flb_sosreport(struct flb_config *config)
 {
@@ -120,29 +176,24 @@ int flb_sosreport(struct flb_config *config)
     struct flb_filter_instance *ins_filter;
     struct flb_output_instance *ins_out;
     struct flb_router_path *route;
-    struct utsname uts;
 
     printf("\n");
     printf("Fluent Bit Enterprise - SOS Report\n");
     printf("==================================\n");
     printf("The following report aims to be used by Fluent Bit and Fluentd "
-           "Enterprise\nCustomers of Treasure Data. For more details visit:\n\n"
-           "    %shttps://fluentd.treasuredata.com%s\n\n", ANSI_BOLD, ANSI_RESET);
+           "community users.\n\n");
 
     /* Fluent Bit */
     printf("\n[Fluent Bit]\n");
-    printf("    Edition\t\t");
-#ifdef FLB_ENTERPRISE
-    printf("Enterprise\n");
-#else
-    printf("Community Edition\n");
-#endif
     printf("    Version\t\t%s\n", FLB_VERSION_STR);
     printf("    Built Flags\t\t%s\n", FLB_INFO_FLAGS);
     printf("\n");
 
-    /* Operating System */
+#ifndef _MSC_VER
+    struct utsname uts;
     uname(&uts);
+
+    /* Operating System */
     printf("[Operating System]\n");
     printf("    Name\t\t%s\n", uts.sysname);
     printf("    Release\t\t%s\n", uts.release);
@@ -154,6 +205,10 @@ int flb_sosreport(struct flb_config *config)
     printf("    Architecture\t%s\n", uts.machine);
     printf("    Processors\t\t%i\n",  (int) sysconf(_SC_NPROCESSORS_ONLN));
     printf("\n");
+#else
+    win32_operating_system_info();
+    win32_hardware_info();
+#endif
 
     /* Fluent Bit */
     printf("[Built Plugins]\n");
@@ -183,7 +238,7 @@ int flb_sosreport(struct flb_config *config)
 
     /* Config: [SERVER] */
     printf("[SERVER] Runtime configuration\n");
-    printf("    Flush\t\t%i\n", config->flush);
+    printf("    Flush\t\t%f\n", config->flush);
     printf("    Daemon\t\t%s\n", config->daemon ? "On": "Off");
     printf("    Log_Level\t\t%s\n", log_level(config->verbose));
     printf("\n");
@@ -203,8 +258,8 @@ int flb_sosreport(struct flb_config *config)
             print_host(&ins_in->host);
         }
 
-        if (ins_in->mp_buf_limit > 0) {
-            flb_utils_bytes_to_human_readable_size(ins_in->mp_buf_limit,
+        if (ins_in->mem_buf_limit > 0) {
+            flb_utils_bytes_to_human_readable_size(ins_in->mem_buf_limit,
                                                    tmp, sizeof(tmp) - 1);
             printf("    Mem_Buf_Limit\t%s\n", tmp);
         }

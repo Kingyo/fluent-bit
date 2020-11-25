@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +21,8 @@
 #ifndef FLB_OUT_LIB
 #define FLB_OUT_LIB
 
+#include <fluent-bit/flb_output_plugin.h>
+
 enum {
     FLB_OUT_LIB_FMT_MSGPACK = 0,
     FLB_OUT_LIB_FMT_JSON,
@@ -31,8 +34,10 @@ enum {
 
 struct flb_out_lib_config {
     int format;
+    int max_records;
     int (*cb_func)(void *record, size_t size, void *data);
     void *cb_data;
+    struct flb_output_instance *ins;
 };
 
 #endif

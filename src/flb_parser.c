@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,10 +27,13 @@
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_utils.h>
+#include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_strptime.h>
+#include <fluent-bit/flb_env.h>
+#include <fluent-bit/flb_str.h>
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <time.h>
 #include <limits.h>
 #include <string.h>
 
@@ -82,24 +86,29 @@ static unsigned u64_to_str(uint64_t value, char* dst) {
 }
 
 int flb_parser_regex_do(struct flb_parser *parser,
-                        char *buf, size_t length,
+                        const char *buf, size_t length,
                         void **out_buf, size_t *out_size,
                         struct flb_time *out_time);
 
 int flb_parser_json_do(struct flb_parser *parser,
-                       char *buf, size_t length,
+                       const char *buf, size_t length,
                        void **out_buf, size_t *out_size,
                        struct flb_time *out_time);
 
 int flb_parser_ltsv_do(struct flb_parser *parser,
-                       char *buf, size_t length,
+                       const char *buf, size_t length,
                        void **out_buf, size_t *out_size,
                        struct flb_time *out_time);
 
-struct flb_parser *flb_parser_create(char *name, char *format,
-                                     char *p_regex,
-                                     char *time_fmt, char *time_key,
-                                     char *time_offset,
+int flb_parser_logfmt_do(struct flb_parser *parser,
+                         const char *buf, size_t length,
+                         void **out_buf, size_t *out_size,
+                         struct flb_time *out_time);
+
+struct flb_parser *flb_parser_create(const char *name, const char *format,
+                                     const char *p_regex,
+                                     const char *time_fmt, const char *time_key,
+                                     const char *time_offset,
                                      int time_keep,
                                      struct flb_parser_types *types,
                                      int types_len,
@@ -110,6 +119,7 @@ struct flb_parser *flb_parser_create(char *name, char *format,
     int len;
     int diff = 0;
     int size;
+    int is_epoch = FLB_FALSE;
     char *tmp;
     struct mk_list *head;
     struct flb_parser *p;
@@ -132,6 +142,7 @@ struct flb_parser *flb_parser_create(char *name, char *format,
         return NULL;
     }
     p->decoders = decoders;
+    mk_list_add(&p->_head, &config->parsers);
 
     /* Format lookup */
     if (strcasecmp(format, "regex") == 0) {
@@ -142,6 +153,9 @@ struct flb_parser *flb_parser_create(char *name, char *format,
     }
     else if (strcmp(format, "ltsv") == 0) {
         p->type = FLB_PARSER_LTSV;
+    }
+    else if (strcmp(format, "logfmt") == 0) {
+        p->type = FLB_PARSER_LOGFMT;
     }
     else {
         flb_error("[parser:%s] Invalid format %s", name, format);
@@ -156,7 +170,7 @@ struct flb_parser *flb_parser_create(char *name, char *format,
             return NULL;
         }
 
-        regex = flb_regex_create((unsigned char *) p_regex);
+        regex = flb_regex_create(p_regex);
         if (!regex) {
             flb_error("[parser:%s] Invalid regex pattern %s", name, p_regex);
             flb_free(p);
@@ -169,10 +183,15 @@ struct flb_parser *flb_parser_create(char *name, char *format,
     p->name = flb_strdup(name);
 
     if (time_fmt) {
+        p->time_fmt_full = flb_strdup(time_fmt);
         p->time_fmt = flb_strdup(time_fmt);
 
         /* Check if the format is considering the year */
         if (strstr(p->time_fmt, "%Y") || strstr(p->time_fmt, "%y")) {
+            p->time_with_year = FLB_TRUE;
+        }
+        else if (strstr(p->time_fmt, "%s")) {
+            is_epoch = FLB_TRUE;
             p->time_with_year = FLB_TRUE;
         }
         else {
@@ -196,6 +215,19 @@ struct flb_parser *flb_parser_create(char *name, char *format,
             *tmp++ = '\0';
         }
 
+        /* Check if the format contains a timezone (%z) */
+        if (strstr(p->time_fmt, "%z") || strstr(p->time_fmt, "%Z") ||
+            strstr(p->time_fmt, "%SZ") || strstr(p->time_fmt, "%S.%LZ")) {
+#if defined(FLB_HAVE_GMTOFF) || !defined(FLB_HAVE_SYSTEM_STRPTIME)
+            p->time_with_tz = FLB_TRUE;
+#else
+            flb_error("[parser] timezone offset not supported");
+            flb_error("[parser] you cannot use %%z/%%Z on this platform");
+            flb_parser_destroy(p);
+            return NULL;
+#endif
+        }
+
         /*
          * Check if the format expect fractional seconds
          *
@@ -208,7 +240,10 @@ struct flb_parser *flb_parser_create(char *name, char *format,
          * - http://stackoverflow.com/questions/7114690/how-to-parse-syslog-timestamp
          * - http://code.activestate.com/lists/python-list/521885/
          */
-        if (p->time_with_year == FLB_TRUE) {
+        if (is_epoch == FLB_TRUE) {
+            tmp = strstr(p->time_fmt, "%s.%L");
+        }
+        else if (p->time_with_year == FLB_TRUE) {
             tmp = strstr(p->time_fmt, "%S.%L");
         }
         else {
@@ -220,19 +255,27 @@ struct flb_parser *flb_parser_create(char *name, char *format,
         }
         if (tmp) {
             tmp[2] = '\0';
-            p->time_frac_secs = (tmp + 3);
+            p->time_frac_secs = (tmp + 5);
         }
         else {
-            p->time_frac_secs = NULL;
-        }
+            /* same as above but with comma seperator */
+            if (p->time_with_year == FLB_TRUE) {
+                tmp = strstr(p->time_fmt, "%S,%L");
+            }
+            else {
+                tmp = strstr(p->time_fmt_year, "%s,%L");
 
-        /* Check if the format contains a timezone (%z) */
-        tmp = strstr(p->time_fmt, "%z");
-        if (tmp) {
-            p->time_with_tz = FLB_TRUE;
-        }
-        else if (strstr(p->time_fmt, "%SZ") || strstr(p->time_fmt, "%S.%LZ")) {
-            p->time_with_tz = FLB_TRUE;
+                if (tmp == NULL) {
+                    tmp = strstr(p->time_fmt_year, "%S,%L");
+                }
+            }
+            if (tmp) {
+                tmp[2] = '\0';
+                p->time_frac_secs = (tmp + 5);
+            }
+            else {
+                p->time_frac_secs = NULL;
+            }
         }
 
         /* Optional fixed timezone offset */
@@ -241,7 +284,7 @@ struct flb_parser *flb_parser_create(char *name, char *format,
             len = strlen(time_offset);
             ret = flb_parser_tzone_offset(time_offset, len, &diff);
             if (ret == -1) {
-                flb_free(p);
+                flb_parser_destroy(p);
                 return NULL;
             }
             p->time_offset = diff;
@@ -255,9 +298,6 @@ struct flb_parser *flb_parser_create(char *name, char *format,
     p->time_keep = time_keep;
     p->types = types;
     p->types_len = types_len;
-
-    mk_list_add(&p->_head, &config->parsers);
-
     return p;
 }
 
@@ -272,6 +312,7 @@ void flb_parser_destroy(struct flb_parser *parser)
     flb_free(parser->name);
     if (parser->time_fmt) {
         flb_free(parser->time_fmt);
+        flb_free(parser->time_fmt_full);
     }
     if (parser->time_fmt_year) {
         flb_free(parser->time_fmt_year);
@@ -306,11 +347,12 @@ void flb_parser_exit(struct flb_config *config)
     }
 }
 
-static int proc_types_str(char *types_str, struct flb_parser_types **types)
+static int proc_types_str(const char *types_str, struct flb_parser_types **types)
 {
     int i = 0;
     int types_num = 0;
     char *type_str = NULL;
+    size_t len;
     struct mk_list *split;
     struct mk_list *head;
     struct flb_split_entry *sentry;
@@ -332,10 +374,9 @@ static int proc_types_str(char *types_str, struct flb_parser_types **types)
             i++;
             continue;
         }
-        *type_str = '\0'; /* for strdup */
-        (*types)[i].key = flb_strdup(sentry->value);
-        (*types)[i].key_len = strlen(sentry->value);
-        *types_str = ':';
+        len = type_str - sentry->value;
+        (*types)[i].key = flb_strndup(sentry->value, len);
+        (*types)[i].key_len = len;
 
         type_str++;
         if (!strcasecmp(type_str, "integer")) {
@@ -360,29 +401,57 @@ static int proc_types_str(char *types_str, struct flb_parser_types **types)
     return i;
 }
 
+static flb_sds_t get_parser_key(char *key,
+                                struct flb_config *config,
+                                struct mk_rconf_section *section)
+{
+    char *tmp;
+    flb_sds_t val;
+
+    tmp = mk_rconf_section_get_key(section, key, MK_RCONF_STR);
+    if (!tmp) {
+        return NULL;
+    }
+
+    val = flb_env_var_translate(config->env, tmp);
+    flb_free(tmp);
+
+    if (!val) {
+        return NULL;
+    }
+
+    if (flb_sds_len(val) == 0) {
+        flb_sds_destroy(val);
+        return NULL;
+    }
+
+    return val;
+}
+
 /* Load parsers from a configuration file */
-int flb_parser_conf_file(char *file, struct flb_config *config)
+int flb_parser_conf_file(const char *file, struct flb_config *config)
 {
     int ret;
     char tmp[PATH_MAX + 1];
-    char *cfg = NULL;
-    char *name;
-    char *format;
-    char *regex;
-    char *time_fmt;
-    char *time_key;
-    char *time_offset;
-    char *types_str;
-    char *str;
+    const char *cfg = NULL;
+    flb_sds_t name;
+    flb_sds_t format;
+    flb_sds_t regex;
+    flb_sds_t time_fmt;
+    flb_sds_t time_key;
+    flb_sds_t time_offset;
+    flb_sds_t types_str;
+    flb_sds_t tmp_str;
     int time_keep;
     int types_len;
     struct mk_rconf *fconf;
     struct mk_rconf_section *section;
     struct mk_list *head;
     struct stat st;
-    struct flb_parser_types *types;
-    struct mk_list *decoders;
+    struct flb_parser_types *types = NULL;
+    struct mk_list *decoders = NULL;
 
+#ifndef FLB_HAVE_STATIC_CONF
     ret = stat(file, &st);
     if (ret == -1 && errno == ENOENT) {
         /* Try to resolve the real path (if exists) */
@@ -400,8 +469,11 @@ int flb_parser_conf_file(char *file, struct flb_config *config)
         cfg = file;
     }
 
-    flb_debug("[parser] opening file %s", cfg);
     fconf = mk_rconf_open(cfg);
+#else
+    fconf = flb_config_static_open(file);
+#endif
+
     if (!fconf) {
         return -1;
     }
@@ -415,6 +487,7 @@ int flb_parser_conf_file(char *file, struct flb_config *config)
         time_key = NULL;
         time_offset = NULL;
         types_str = NULL;
+        tmp_str = NULL;
 
         section = mk_list_entry(head, struct mk_rconf_section, _head);
         if (strcasecmp(section->name, "PARSER") != 0) {
@@ -422,53 +495,47 @@ int flb_parser_conf_file(char *file, struct flb_config *config)
         }
 
         /* Name */
-        name = mk_rconf_section_get_key(section, "Name", MK_RCONF_STR);
+        name = get_parser_key("Name", config, section);
         if (!name) {
-            flb_error("[parser] no parser 'name' found");
+            flb_error("[parser] no parser 'name' found in file '%s'", cfg);
             goto fconf_error;
         }
 
         /* Format */
-        format = mk_rconf_section_get_key(section, "Format", MK_RCONF_STR);
+        format = get_parser_key("Format", config, section);
         if (!format) {
-            flb_error("[parser] no parser 'format' found");
+            flb_error("[parser] no parser 'format' found for '%s' in file '%s'",
+                      name, cfg);
             goto fconf_error;
         }
 
-        /* Regex (if format is regex) */
-        regex = mk_rconf_section_get_key(section, "Regex", MK_RCONF_STR);
+        /* Regex (if 'format' == 'regex') */
+        regex = get_parser_key("Regex", config, section);
         if (!regex && strcmp(format, "regex") == 0) {
-            flb_error("[parser] no parser 'regex' found");
+            flb_error("[parser] no parser 'regex' found for '%s' in file '%s", name, cfg);
             goto fconf_error;
         }
 
         /* Time_Format */
-        time_fmt = mk_rconf_section_get_key(section, "Time_Format",
-                                            MK_RCONF_STR);
+        time_fmt = get_parser_key("Time_Format", config, section);
 
         /* Time_Key */
-        time_key = mk_rconf_section_get_key(section, "Time_Key",
-                                            MK_RCONF_STR);
+        time_key = get_parser_key("Time_Key", config, section);
 
         /* Time_Keep */
-        str = mk_rconf_section_get_key(section, "Time_Keep",
-                                       MK_RCONF_STR);
-        if (str) {
-            time_keep = flb_utils_bool(str);
-            flb_free(str);
-        }
-        else {
-            time_keep = FLB_FALSE;
+        time_keep = FLB_FALSE;
+        tmp_str = get_parser_key("Time_Keep", config, section);
+        if (tmp_str) {
+            time_keep = flb_utils_bool(tmp_str);
+            flb_sds_destroy(tmp_str);
         }
 
         /* Time_Offset (UTC offset) */
-        time_offset = mk_rconf_section_get_key(section, "Time_Offset",
-                                               MK_RCONF_STR);
+        time_offset = get_parser_key("Time_Offset", config, section);
 
         /* Types */
-        types_str = mk_rconf_section_get_key(section, "Types",
-                                            MK_RCONF_STR);
-        if (types_str != NULL) {
+        types_str = get_parser_key("Types", config, section);
+        if (types_str) {
             types_len = proc_types_str(types_str, &types);
         }
         else {
@@ -487,25 +554,24 @@ int flb_parser_conf_file(char *file, struct flb_config *config)
 
         flb_debug("[parser] new parser registered: %s", name);
 
-        flb_free(name);
-        flb_free(format);
+        flb_sds_destroy(name);
+        flb_sds_destroy(format);
 
         if (regex) {
-            flb_free(regex);
+            flb_sds_destroy(regex);
         }
         if (time_fmt) {
-            flb_free(time_fmt);
+            flb_sds_destroy(time_fmt);
         }
         if (time_key) {
-            flb_free(time_key);
+            flb_sds_destroy(time_key);
         }
         if (time_offset) {
-            flb_free(time_offset);
+            flb_sds_destroy(time_offset);
         }
         if (types_str) {
-            flb_free(types_str);
+            flb_sds_destroy(types_str);
         }
-
         decoders = NULL;
     }
 
@@ -513,19 +579,22 @@ int flb_parser_conf_file(char *file, struct flb_config *config)
     return 0;
 
  fconf_error:
-    flb_free(name);
-    flb_free(format);
+    flb_sds_destroy(name);
+    flb_sds_destroy(format);
     if (regex) {
-        flb_free(regex);
+        flb_sds_destroy(regex);
     }
     if (time_fmt) {
-        flb_free(time_fmt);
+        flb_sds_destroy(time_fmt);
     }
     if (time_key) {
-        flb_free(time_key);
+        flb_sds_destroy(time_key);
+    }
+    if (time_offset) {
+        flb_sds_destroy(time_offset);
     }
     if (types_str) {
-        flb_free(types_str);
+        flb_sds_destroy(types_str);
     }
     if (decoders) {
         flb_parser_decoder_list_destroy(decoders);
@@ -534,7 +603,7 @@ int flb_parser_conf_file(char *file, struct flb_config *config)
     return -1;
 }
 
-struct flb_parser *flb_parser_get(char *name, struct flb_config *config)
+struct flb_parser *flb_parser_get(const char *name, struct flb_config *config)
 {
     struct mk_list *head;
     struct flb_parser *parser;
@@ -550,7 +619,7 @@ struct flb_parser *flb_parser_get(char *name, struct flb_config *config)
     return NULL;
 }
 
-int flb_parser_do(struct flb_parser *parser, char *buf, size_t length,
+int flb_parser_do(struct flb_parser *parser, const char *buf, size_t length,
                   void **out_buf, size_t *out_size, struct flb_time *out_time)
 {
 
@@ -566,18 +635,22 @@ int flb_parser_do(struct flb_parser *parser, char *buf, size_t length,
         return flb_parser_ltsv_do(parser, buf, length,
                                   out_buf, out_size, out_time);
     }
+    else if (parser->type == FLB_PARSER_LOGFMT) {
+        return flb_parser_logfmt_do(parser, buf, length,
+                                  out_buf, out_size, out_time);
+    }
 
     return -1;
 }
 
 /* Given a timezone string, return it numeric offset */
-int flb_parser_tzone_offset(char *str, int len, int *tmdiff)
+int flb_parser_tzone_offset(const char *str, int len, int *tmdiff)
 {
     int neg;
     long hour;
     long min;
-    char *end;
-    char *p = str;
+    const char *end;
+    const char *p = str;
 
     /* Check timezones */
     if (*p == 'Z') {
@@ -619,20 +692,19 @@ int flb_parser_tzone_offset(char *str, int len, int *tmdiff)
     return 0;
 }
 
-int flb_parser_time_lookup(char *time_str, size_t tsize,
+int flb_parser_time_lookup(const char *time_str, size_t tsize,
                            time_t now,
                            struct flb_parser *parser,
                            struct tm *tm, double *ns)
 {
     int ret;
     int slen;
-    int tmdiff = 0;
     time_t time_now;
     double tmfrac = 0;
     char *p = NULL;
     char *fmt;
     int time_len = tsize;
-    char *time_ptr = time_str;
+    const char *time_ptr = time_str;
     char tmp[64];
     char fs_tmp[32];
     struct tm tmy;
@@ -667,6 +739,11 @@ int flb_parser_time_lookup(char *time_str, size_t tsize,
         }
 
         gmtime_r(&time_now, &tmy);
+
+        /* Make the timestamp default to today */
+        tm->tm_mon = tmy.tm_mon;
+        tm->tm_mday = tmy.tm_mday;
+
         uint64_t t = tmy.tm_year + 1900;
 
         fmt = tmp;
@@ -680,15 +757,15 @@ int flb_parser_time_lookup(char *time_str, size_t tsize,
 
         time_ptr = tmp;
         time_len = strlen(tmp);
-        p = strptime(time_ptr, parser->time_fmt_year, tm);
+        p = flb_strptime(time_ptr, parser->time_fmt_year, tm);
     }
     else {
-        p = strptime(time_ptr, parser->time_fmt, tm);
+        p = flb_strptime(time_ptr, parser->time_fmt, tm);
     }
 
     if (p != NULL) {
         /* Check if we have fractional seconds */
-        if (parser->time_frac_secs && *p == '.') {
+        if (parser->time_frac_secs && (*p == '.' || *p == ',')) {
             /*
              * Further parser routines needs a null byte, for fractional seconds
              * we make a safe copy of the content.
@@ -701,73 +778,76 @@ int flb_parser_time_lookup(char *time_str, size_t tsize,
             fs_tmp[slen] = '\0';
 
             /* Parse fractional seconds */
-            tmdiff = 0;
-            ret = flb_parser_frac_tzone(fs_tmp, slen, &tmfrac, &tmdiff);
+            ret = flb_parser_frac(fs_tmp, slen, &tmfrac, &time_ptr);
             if (ret == -1) {
-                /* Check if the timezone failed */
-                if (tmdiff == -1) {
-                    /* Try to find a workaround for time offset resolution */
-                    tm->tm_gmtoff = parser->time_offset;
-                }
-                else {
-                    flb_warn("[parser] Error parsing time string");
-                    return -1;
-                }
-            }
-            else {
-                tm->tm_gmtoff = tmdiff;
+                flb_warn("[parser] Error parsing time string");
+                return -1;
             }
             *ns = tmfrac;
-        }
-        else {
-            if (parser->time_with_tz == FLB_FALSE) {
-                tm->tm_gmtoff = parser->time_offset;
+
+            p = flb_strptime(time_ptr, parser->time_frac_secs, tm);
+
+            if (p == NULL) {
+                return -1;
             }
         }
+
+#ifdef FLB_HAVE_GMTOFF
+        if (parser->time_with_tz == FLB_FALSE) {
+            tm->tm_gmtoff = parser->time_offset;
+        }
+#endif
+
         return 0;
     }
 
     return -1;
 }
 
-int flb_parser_frac_tzone(char *str, int len, double *frac, int *tmdiff)
+int flb_parser_frac(const char *str, int len, double *frac, const char **end)
 {
-    int ret;
-    int tz_len;
+    int ret = 0;
     char *p;
-    char *end;
     double d;
+    const char *pstr;
+    char *tmp = NULL;
 
     /* Fractional seconds */
-    d = strtod(str, &end);
-    if ((d == 0 && end == str) || !end) {
-        return -1;
+    /* Normalize the fractional seperator to be '.' since that's what strtod()
+     * expects in standard C locale */
+    if (*str == ',') {
+        tmp = flb_strdup(str);
+        tmp[0] = '.';
+        pstr = tmp;
+    }
+    else {
+        pstr = str;
+    }
+
+    d = strtod(pstr, &p);
+    if ((d == 0 && p == pstr) || !p) {
+        ret = -1;
+        goto free_and_return;
     }
     *frac = d;
+    *end = str + (p - pstr);
 
-    tz_len = len - (end - str);
-    p = end;
-    while (*p == ' ') p++;
-
-    tz_len -= (p - end);
-    ret = flb_parser_tzone_offset(p, tz_len, tmdiff);
-    if (ret == -1) {
-        *tmdiff = -1;
-        return -1;
+free_and_return:
+    if (tmp != NULL) {
+        flb_free(tmp);
     }
-
-    return 0;
+    return ret;
 }
 
-int flb_parser_typecast(char *key, int key_len,
-                        char *val, int val_len,
+int flb_parser_typecast(const char *key, int key_len,
+                        const char *val, int val_len,
                         msgpack_packer *pck,
                         struct flb_parser_types *types,
                         int types_len)
 {
     int i;
     int error = FLB_FALSE;
-    char tmp_char;
+    char *tmp_str;
     int casted = FLB_FALSE;
 
     for(i=0; i<types_len; i++){
@@ -786,24 +866,20 @@ int flb_parser_typecast(char *key, int key_len,
                     long long lval;
 
                     /* msgpack char is not null terminated.
-                       So backup and fill null char,
-                       convert int,
-                       rewind char.
+                       So make a temporary copy.
                      */
-                    tmp_char = val[val_len];
-                    val[val_len] = '\0';
-                    lval = atoll(val);
-                    val[val_len] = tmp_char;
+                    tmp_str = flb_strndup(val, val_len);
+                    lval = atoll(tmp_str);
+                    flb_free(tmp_str);
                     msgpack_pack_int64(pck, lval);
                 }
                 break;
             case FLB_PARSER_TYPE_HEX:
                 {
                     unsigned long long lval;
-                    tmp_char = val[val_len];
-                    val[val_len] = '\0';
-                    lval = strtoull(val, NULL, 16);
-                    val[val_len] = tmp_char;
+                    tmp_str = flb_strndup(val, val_len);
+                    lval = strtoull(tmp_str, NULL, 16);
+                    flb_free(tmp_str);
                     msgpack_pack_uint64(pck, lval);
                 }
                 break;
@@ -811,10 +887,9 @@ int flb_parser_typecast(char *key, int key_len,
             case FLB_PARSER_TYPE_FLOAT:
                 {
                     double dval;
-                    tmp_char = val[val_len];
-                    val[val_len] = '\0';
-                    dval = atof(val);
-                    val[val_len] = tmp_char;
+                    tmp_str = flb_strndup(val, val_len);
+                    dval = atof(tmp_str);
+                    flb_free(tmp_str);
                     msgpack_pack_double(pck, dval);
                 }
                 break;

@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,5 +44,8 @@
 /* JSON errors */
 #define FLB_ERR_JSON_INVAL           -501
 #define FLB_ERR_JSON_PART            -502
+
+/* Coroutine errors */
+#define FLB_ERR_CORO_STACK_SIZE      -600
 
 #endif

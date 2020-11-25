@@ -22,7 +22,6 @@ if (CMAKE_SYSTEM_NAME MATCHES "Windows")
   MK_DEFINITION(MK_THREADS_WIN32)
   set(src
     ${src}
-    "external/wingetopt.c"
     "external/winpthreads.c"
     )
   include_directories(deps/libevent/include)
@@ -36,10 +35,8 @@ endif()
 check_c_source_compiles("
   #include <sys/types.h>
   #include <sys/stat.h>
-  #include <unistd.h>
   int main() {
-    int x = S_IXUSR;
-    S_ISLNK(0);
+    struct stat st;
     return 0;
   }" HAVE_STAT_H)
 if (HAVE_STAT_H)
@@ -140,8 +137,4 @@ target_link_libraries(mk_core ${CMAKE_THREAD_LIBS_INIT})
 
 if (CMAKE_SYSTEM_NAME MATCHES "Windows")
   target_link_libraries(mk_core event)
-endif()
-
-if(NOT MK_SYSTEM_MALLOC)
-  target_link_libraries(mk_core libjemalloc)
 endif()

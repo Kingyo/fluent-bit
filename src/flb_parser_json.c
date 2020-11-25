@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,7 +27,7 @@
 #include <fluent-bit/flb_parser_decoder.h>
 
 int flb_parser_json_do(struct flb_parser *parser,
-                       char *in_buf, size_t in_size,
+                       const char *in_buf, size_t in_size,
                        void **out_buf, size_t *out_size,
                        struct flb_time *out_time)
 {
@@ -34,6 +35,7 @@ int flb_parser_json_do(struct flb_parser *parser,
     int skip;
     int ret;
     int slen;
+    int root_type;
     double tmfrac = 0;
     char *mp_buf = NULL;
     char *time_key;
@@ -55,14 +57,14 @@ int flb_parser_json_do(struct flb_parser *parser,
     struct flb_time *t;
 
     /* Convert incoming in_buf JSON message to message pack format */
-    ret = flb_pack_json(in_buf, in_size, &mp_buf, &mp_size);
+    ret = flb_pack_json(in_buf, in_size, &mp_buf, &mp_size, &root_type);
     if (ret != 0) {
         return -1;
     }
 
     /* Make sure object is a map */
     msgpack_unpacked_init(&result);
-    if (msgpack_unpack_next(&result, mp_buf, mp_size, &off)) {
+    if (msgpack_unpack_next(&result, mp_buf, mp_size, &off) == MSGPACK_UNPACK_SUCCESS) {
         map = result.data;
         if (map.type != MSGPACK_OBJECT_MAP) {
             flb_free(mp_buf);
@@ -152,7 +154,7 @@ int flb_parser_json_do(struct flb_parser *parser,
     }
 
     /* Lookup time */
-    ret = flb_parser_time_lookup((char *) v->via.str.ptr, v->via.str.size,
+    ret = flb_parser_time_lookup(v->via.str.ptr, v->via.str.size,
                                  0, parser, &tm, &tmfrac);
     if (ret == -1) {
         len = v->via.str.size;
@@ -161,9 +163,9 @@ int flb_parser_json_do(struct flb_parser *parser,
         }
         memcpy(tmp, v->via.str.ptr, len);
         tmp[len] = '\0';
-        flb_warn("[parser:%s] Invalid time format %s for '%s'.",
-                 parser->name, parser->time_fmt, tmp);
-        time_lookup = time(NULL);
+        flb_warn("[parser:%s] invalid time format %s for '%s'",
+                 parser->name, parser->time_fmt_full, tmp);
+        time_lookup = 0;
     }
     else {
         time_lookup = flb_parser_tm2time(&tm);

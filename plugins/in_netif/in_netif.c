@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +18,7 @@
  *  limitations under the License.
  */
 
-#include <fluent-bit/flb_info.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_pack.h>
@@ -25,8 +26,6 @@
 
 #include <stdio.h>
 #include "in_netif.h"
-
-
 
 struct entry_define entry_name_linux[] = {
     {"rx.bytes",       FLB_TRUE},
@@ -72,7 +71,12 @@ static int init_entry_linux(struct flb_in_netif_config *ctx)
 
     ctx->entry_len = sizeof(entry_name_linux) / sizeof(struct entry_define);
     ctx->entry = flb_malloc(sizeof(struct netif_entry) * ctx->entry_len);
-    for(i=0; i<ctx->entry_len; i++) {
+    if (!ctx->entry) {
+        flb_errno();
+        return -1;
+    }
+
+    for(i = 0; i < ctx->entry_len; i++) {
         ctx->entry[i].name     = entry_name_linux[i].name;
         ctx->entry[i].name_len = strlen(entry_name_linux[i].name);
         ctx->entry[i].prev     = 0;
@@ -95,7 +99,7 @@ static int configure(struct flb_in_netif_config *ctx,
                      int *interval_sec,
                      int *interval_nsec)
 {
-    char *pval = NULL;
+    const char *pval = NULL;
     ctx->map_num = 0;
 
     /* interval settings */
@@ -131,22 +135,21 @@ static int configure(struct flb_in_netif_config *ctx,
 
     ctx->interface = flb_input_get_property("interface", in);
     if (ctx->interface == NULL) {
-        flb_error("[in_netif] \"interface\" is not set");
+        flb_plg_error(ctx->ins, "'interface' is not set");
         return -1;
     }
     ctx->interface_len = strlen(ctx->interface);
 
     ctx->first_snapshot = FLB_TRUE;    /* assign first_snapshot with FLB_TRUE */
-    
-    init_entry_linux(ctx);
-    
-    return 0;
+
+    return init_entry_linux(ctx);
 }
 
 static inline int is_specific_interface(struct flb_in_netif_config *ctx,
                                         char* interface)
 {
-    if (ctx->interface != NULL && !strncmp(ctx->interface, interface, ctx->interface_len)) {
+    if (ctx->interface != NULL &&
+        !strncmp(ctx->interface, interface, ctx->interface_len)) {
         return FLB_TRUE;
     }
     return FLB_FALSE;
@@ -161,7 +164,7 @@ static int parse_proc_line(char *line,
 
     int i = 0;
     int entry_num;
-    
+
     split = flb_utils_split(line, ' ', 256);
     entry_num = mk_list_size(split);
     if (entry_num != ctx->entry_len + 1) {
@@ -213,43 +216,55 @@ static int in_netif_collect_linux(struct flb_input_instance *i_ins,
     int  key_len;
     int i;
     int entry_len = ctx->entry_len;
+    msgpack_packer mp_pck;
+    msgpack_sbuffer mp_sbuf;
 
     fp = fopen("/proc/net/dev", "r");
     if (fp == NULL) {
-        flb_error("[in_netif]fopen error\n");
+        flb_errno();
+        flb_plg_error(ctx->ins, "cannot open /proc/net/dev");
         return -1;
     }
     while(fgets(line, LINE_LEN-1, fp) != NULL){
         parse_proc_line(line, ctx);
     }
 
-    if ( ctx->first_snapshot == FLB_TRUE ){   /* if in_netif are called for the first time, assign prev with now */
-        for(i=0; i<entry_len; i++) {
+    if (ctx->first_snapshot == FLB_TRUE) {
+        /* if in_netif are called for the first time, assign prev with now */
+        for (i = 0; i < entry_len; i++) {
             ctx->entry[i].prev = ctx->entry[i].now;
         }
-        ctx->first_snapshot = FLB_FALSE;      /* assign first_snapshot with FLB_FALSE */
+
+        /* assign first_snapshot with FLB_FALSE */
+        ctx->first_snapshot = FLB_FALSE;
     }
     else {
-        flb_input_buf_write_start(i_ins);
-    
-        msgpack_pack_array(&i_ins->mp_pck, 2);
-        flb_pack_time_now(&i_ins->mp_pck);
-        msgpack_pack_map(&i_ins->mp_pck, ctx->map_num);
-        for(i=0; i<entry_len; i++) {
+        /* Initialize local msgpack buffer */
+        msgpack_sbuffer_init(&mp_sbuf);
+        msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
+
+        /* Pack data */
+        msgpack_pack_array(&mp_pck, 2);
+        flb_pack_time_now(&mp_pck);
+        msgpack_pack_map(&mp_pck, ctx->map_num);
+
+        for (i = 0; i < entry_len; i++) {
             if (ctx->entry[i].checked) {
                 key_len = ctx->interface_len + ctx->entry[i].name_len + 1/* '.' */;
 
-                snprintf(key_name, key_len+1/* add null character */,
-                     "%s.%s", ctx->interface, ctx->entry[i].name);
-                msgpack_pack_str(&i_ins->mp_pck, key_len);
-                msgpack_pack_str_body(&i_ins->mp_pck, key_name, key_len);
+                snprintf(key_name, key_len + 1 /* add null character */,
+                         "%s.%s", ctx->interface, ctx->entry[i].name);
+                msgpack_pack_str(&mp_pck, key_len);
+                msgpack_pack_str_body(&mp_pck, key_name, key_len);
 
-                msgpack_pack_uint64(&i_ins->mp_pck, calc_diff(&ctx->entry[i]));
+                msgpack_pack_uint64(&mp_pck, calc_diff(&ctx->entry[i]));
 
                 ctx->entry[i].prev = ctx->entry[i].now;
             }
         }
-        flb_input_buf_write_end(i_ins);
+
+        flb_input_chunk_append_raw(i_ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
+        msgpack_sbuffer_destroy(&mp_sbuf);
     }
 
     fclose(fp);
@@ -257,13 +272,13 @@ static int in_netif_collect_linux(struct flb_input_instance *i_ins,
 }
 
 static int in_netif_collect(struct flb_input_instance *i_ins,
-                           struct flb_config *config, void *in_context)
+                            struct flb_config *config, void *in_context)
 {
     return in_netif_collect_linux(i_ins, config, in_context);
 }
 
 static int in_netif_init(struct flb_input_instance *in,
-                          struct flb_config *config, void *data)
+                         struct flb_config *config, void *data)
 {
     int ret;
     int interval_sec = 0;
@@ -275,9 +290,10 @@ static int in_netif_init(struct flb_input_instance *in,
     /* Allocate space for the configuration */
     ctx = flb_calloc(1, sizeof(struct flb_in_netif_config));
     if (!ctx) {
-        perror("calloc");
+        flb_errno();
         return -1;
     }
+    ctx->ins = in;
 
     if (configure(ctx, in, &interval_sec, &interval_nsec) < 0) {
         config_destroy(ctx);
@@ -294,7 +310,7 @@ static int in_netif_init(struct flb_input_instance *in,
                                        interval_nsec,
                                        config);
     if (ret == -1) {
-        flb_error("Could not set collector for Proc input plugin");
+        flb_plg_error(ctx->ins, "Could not set collector for Proc input plugin");
         config_destroy(ctx);
         return -1;
     }

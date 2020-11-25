@@ -2,6 +2,7 @@
 
 /*  Fluent Bit Demo
  *  ===============
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +28,7 @@
 #include <fluent-bit/flb_filter.h>
 #include <fluent-bit/flb_utils.h>
 #include <fluent-bit/flb_time.h>
+#include <fluent-bit/flb_callback.h>
 
 #include <signal.h>
 #include <stdarg.h>
@@ -35,7 +37,23 @@
 #include <mcheck.h>
 #endif
 
-extern struct flb_input_plugin in_lib_plugin;
+/* thread initializator */
+static pthread_once_t flb_lib_once = PTHREAD_ONCE_INIT;
+
+#ifdef FLB_SYSTEM_WINDOWS
+static inline int flb_socket_init_win32(void)
+{
+    WSADATA wsaData;
+    int err;
+
+    err = WSAStartup(MAKEWORD(2, 2), &wsaData);
+    if (err != 0) {
+        fprintf(stderr, "WSAStartup failed with error: %d\n", err);
+        return err;
+    }
+    return 0;
+}
+#endif
 
 static inline struct flb_input_instance *in_instance_get(flb_ctx_t *ctx,
                                                          int ffd)
@@ -61,13 +79,7 @@ static inline struct flb_output_instance *out_instance_get(flb_ctx_t *ctx,
 
     mk_list_foreach(head, &ctx->config->outputs) {
         o_ins = mk_list_entry(head, struct flb_output_instance, _head);
-
-        /*
-         * A small different between input/output instances. The output
-         * instances already have an unique mask_id used for routing, so we
-         * use it as an identificator for the API.
-         */
-        if (o_ins->mask_id == ffd) {
+        if (o_ins->id == ffd) {
             return o_ins;
         }
     }
@@ -76,7 +88,7 @@ static inline struct flb_output_instance *out_instance_get(flb_ctx_t *ctx,
 }
 
 static inline struct flb_filter_instance *filter_instance_get(flb_ctx_t *ctx,
-                                                         int ffd)
+                                                              int ffd)
 {
     struct mk_list *head;
     struct flb_filter_instance *f_ins;
@@ -91,6 +103,12 @@ static inline struct flb_filter_instance *filter_instance_get(flb_ctx_t *ctx,
     return NULL;
 }
 
+void flb_init_env()
+{
+    flb_thread_prepare();
+    flb_output_prepare();
+}
+
 flb_ctx_t *flb_create()
 {
     int ret;
@@ -100,6 +118,13 @@ flb_ctx_t *flb_create()
 #ifdef FLB_HAVE_MTRACE
     /* Start tracing malloc and free */
     mtrace();
+#endif
+
+#ifdef FLB_SYSTEM_WINDOWS
+    /* Ensure we initialized Windows Sockets */
+    if (flb_socket_init_win32()) {
+        return NULL;
+    }
 #endif
 
     ctx = flb_calloc(1, sizeof(flb_ctx_t));
@@ -114,6 +139,7 @@ flb_ctx_t *flb_create()
         return NULL;
     }
     ctx->config = config;
+    ctx->status = FLB_LIB_NONE;
 
     /*
      * Initialize our pipe to send data to our worker, used
@@ -138,6 +164,15 @@ flb_ctx_t *flb_create()
 
     /* Prepare the notification channels */
     ctx->event_channel = flb_calloc(1, sizeof(struct mk_event));
+    if (!ctx->event_channel) {
+        perror("calloc");
+        flb_config_exit(ctx->config);
+        flb_free(ctx);
+        return NULL;
+    }
+
+    MK_EVENT_ZERO(ctx->event_channel);
+
     ret = mk_event_channel_create(config->ch_evl,
                                   &config->ch_notif[0],
                                   &config->ch_notif[1],
@@ -155,6 +190,10 @@ flb_ctx_t *flb_create()
 /* Release resources associated to the library context */
 void flb_destroy(flb_ctx_t *ctx)
 {
+    if (!ctx) {
+        return;
+    }
+
     if (ctx->event_channel) {
         mk_event_del(ctx->event_loop, ctx->event_channel);
         flb_free(ctx->event_channel);
@@ -163,6 +202,7 @@ void flb_destroy(flb_ctx_t *ctx)
     /* Remove resources from the event loop */
     mk_event_loop_destroy(ctx->event_loop);
     flb_free(ctx);
+    ctx = NULL;
 
 #ifdef FLB_HAVE_MTRACE
     /* Stop tracing malloc and free */
@@ -171,11 +211,11 @@ void flb_destroy(flb_ctx_t *ctx)
 }
 
 /* Defines a new input instance */
-int flb_input(flb_ctx_t *ctx, char *input, void *data)
+int flb_input(flb_ctx_t *ctx, const char *input, void *data)
 {
     struct flb_input_instance *i_ins;
 
-    i_ins = flb_input_new(ctx->config, input, data);
+    i_ins = flb_input_new(ctx->config, input, data, FLB_TRUE);
     if (!i_ins) {
         return -1;
     }
@@ -184,7 +224,7 @@ int flb_input(flb_ctx_t *ctx, char *input, void *data)
 }
 
 /* Defines a new output instance */
-int flb_output(flb_ctx_t *ctx, char *output, void *data)
+int flb_output(flb_ctx_t *ctx, const char *output, void *data)
 {
     struct flb_output_instance *o_ins;
 
@@ -193,11 +233,11 @@ int flb_output(flb_ctx_t *ctx, char *output, void *data)
         return -1;
     }
 
-    return o_ins->mask_id;
+    return o_ins->id;
 }
 
 /* Defines a new filter instance */
-int flb_filter(flb_ctx_t *ctx, char *filter, void *data)
+int flb_filter(flb_ctx_t *ctx, const char *filter, void *data)
 {
     struct flb_filter_instance *f_ins;
 
@@ -228,6 +268,7 @@ int flb_input_set(flb_ctx_t *ctx, int ffd, ...)
         value = va_arg(va, char *);
         if (!value) {
             /* Wrong parameter */
+            va_end(va);
             return -1;
         }
         ret = flb_input_set_property(i_ins, key, value);
@@ -260,6 +301,7 @@ int flb_output_set(flb_ctx_t *ctx, int ffd, ...)
         value = va_arg(va, char *);
         if (!value) {
             /* Wrong parameter */
+            va_end(va);
             return -1;
         }
 
@@ -271,6 +313,52 @@ int flb_output_set(flb_ctx_t *ctx, int ffd, ...)
     }
 
     va_end(va);
+    return 0;
+}
+
+int flb_output_set_callback(flb_ctx_t *ctx, int ffd, char *name,
+                            void (*cb)(char *, void *, void *))
+{
+    struct flb_output_instance *o_ins;
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    return flb_callback_set(o_ins->callback, name, cb);
+}
+
+int flb_output_set_test(flb_ctx_t *ctx, int ffd, char *test_name,
+                        void (*out_callback) (void *, int, int, void *, size_t, void *),
+                        void *out_callback_data,
+                        void *test_ctx)
+{
+    struct flb_output_instance *o_ins;
+
+    o_ins = out_instance_get(ctx, ffd);
+    if (!o_ins) {
+        return -1;
+    }
+
+    /*
+     * Enabling a test, set the output instance in 'test' mode, so no real
+     * flush callback is invoked, only the desired implemented test.
+     */
+
+    /* Formatter test */
+    if (strcmp(test_name, "formatter") == 0) {
+        o_ins->test_mode = FLB_TRUE;
+        o_ins->test_formatter.rt_ctx = ctx;
+        o_ins->test_formatter.rt_ffd = ffd;
+        o_ins->test_formatter.rt_out_callback = out_callback;
+        o_ins->test_formatter.rt_data = out_callback_data;
+        o_ins->test_formatter.flush_ctx = test_ctx;
+    }
+    else {
+        return -1;
+    }
+
     return 0;
 }
 
@@ -293,6 +381,7 @@ int flb_filter_set(flb_ctx_t *ctx, int ffd, ...)
         value = va_arg(va, char *);
         if (!value) {
             /* Wrong parameter */
+            va_end(va);
             return -1;
         }
 
@@ -321,6 +410,7 @@ int flb_service_set(flb_ctx_t *ctx, ...)
         value = va_arg(va, char *);
         if (!value) {
             /* Wrong parameter */
+            va_end(va);
             return -1;
         }
 
@@ -336,7 +426,7 @@ int flb_service_set(flb_ctx_t *ctx, ...)
 }
 
 /* Load a configuration file that may be used by the input or output plugin */
-int flb_lib_config_file(struct flb_lib_ctx *ctx, char *path)
+int flb_lib_config_file(struct flb_lib_ctx *ctx, const char *path)
 {
     if (access(path, R_OK) != 0) {
         perror("access");
@@ -364,10 +454,16 @@ int flb_lib_free(void* data)
 
 
 /* Push some data into the Engine */
-int flb_lib_push(flb_ctx_t *ctx, int ffd, void *data, size_t len)
+int flb_lib_push(flb_ctx_t *ctx, int ffd, const void *data, size_t len)
 {
     int ret;
     struct flb_input_instance *i_ins;
+
+
+    if (ctx->status == FLB_LIB_NONE || ctx->status == FLB_LIB_ERROR) {
+        flb_error("[lib] cannot push data, engine is not running");
+        return -1;
+    }
 
     i_ins = in_instance_get(ctx, ffd);
     if (!i_ins) {
@@ -387,7 +483,8 @@ static void flb_lib_worker(void *data)
     int ret;
     struct flb_config *config = data;
 
-    flb_log_init(config, FLB_LOG_STDERR, FLB_LOG_INFO, NULL);
+    mk_utils_worker_rename("flb-pipeline");
+
     ret = flb_engine_start(config);
     if (ret == -1) {
         flb_engine_failed(config);
@@ -415,6 +512,8 @@ int flb_start(flb_ctx_t *ctx)
     struct mk_event *event;
     struct flb_config *config;
 
+    pthread_once(&flb_lib_once, flb_init_env);
+
     config = ctx->config;
     ret = mk_utils_worker_spawn(flb_lib_worker, config, &tid);
     if (ret == -1) {
@@ -426,17 +525,20 @@ int flb_start(flb_ctx_t *ctx)
     mk_event_wait(config->ch_evl);
     mk_event_foreach(event, config->ch_evl) {
         fd = event->fd;
-        bytes = read(fd, &val, sizeof(uint64_t));
+        bytes = flb_pipe_r(fd, &val, sizeof(uint64_t));
         if (bytes <= 0) {
+            ctx->status = FLB_LIB_ERROR;
             return -1;
         }
 
         if (val == FLB_ENGINE_STARTED) {
             flb_debug("[lib] backend started");
+            ctx->status = FLB_LIB_OK;
             break;
         }
         else if (val == FLB_ENGINE_FAILED) {
             flb_error("[lib] backend failed");
+            ctx->status = FLB_LIB_ERROR;
             return -1;
         }
     }
@@ -444,10 +546,27 @@ int flb_start(flb_ctx_t *ctx)
     return 0;
 }
 
+int flb_loop(flb_ctx_t *ctx)
+{
+    int ret;
+    pthread_t tid;
+
+    tid = ctx->config->worker;
+    ret = pthread_join(tid, NULL);
+    flb_debug("[lib] Fluent Bit exiting...");
+
+    return ret;
+}
+
 /* Stop the engine */
 int flb_stop(flb_ctx_t *ctx)
 {
     int ret;
+    pthread_t tid;
+
+    if (ctx->status == FLB_LIB_NONE || ctx->status == FLB_LIB_ERROR) {
+        return 0;
+    }
 
     if (!ctx->config) {
         return 0;
@@ -458,8 +577,10 @@ int flb_stop(flb_ctx_t *ctx)
     }
 
     flb_debug("[lib] sending STOP signal to the engine");
+
+    tid = ctx->config->worker;
     flb_engine_exit(ctx->config);
-    ret = pthread_join(ctx->config->worker, NULL);
+    ret = pthread_join(tid, NULL);
     flb_debug("[lib] Fluent Bit engine stopped");
 
     return ret;

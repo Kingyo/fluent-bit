@@ -6,13 +6,48 @@ set(UNIT_TESTS_FILES
   pack.c
   pipe.c
   sds.c
-  parser.c
+  sha512.c
+  slist.c
+  router.c
   network.c
   unit_sizes.c
   hashtable.c
   http_client.c
   utils.c
+  gzip.c
+  random.c
+  config_map.c
+  mp.c
+  input_chunk.c
   )
+
+if (NOT WIN32)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    gelf.c
+    )
+endif()
+
+if(FLB_PARSER)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    parser.c
+    )
+endif()
+
+if(FLB_STREAM_PROCESSOR)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    stream_processor.c
+    )
+endif()
+
+if(FLB_RECORD_ACCESSOR)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    record_accessor.c
+    )
+endif()
 
 if(FLB_METRICS)
   set(UNIT_TESTS_FILES
@@ -21,11 +56,32 @@ if(FLB_METRICS)
     )
 endif()
 
+if(FLB_SIGNV4)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    signv4.c
+    )
+endif()
+
+if(FLB_AWS)
+  set(UNIT_TESTS_FILES
+    ${UNIT_TESTS_FILES}
+    aws_util.c
+    aws_credentials.c
+    aws_credentials_ec2.c
+    aws_credentials_sts.c
+    aws_credentials_http.c
+    aws_credentials_profile.c
+    )
+endif()
+
 set(UNIT_TESTS_DATA
   data/pack/json_single_map_001.json
   data/pack/json_single_map_002.json
   data/parser/json.conf
   data/parser/regex.conf
+  data/input_chunk/log/a_thousand_plus_one_bytes.log
+  data/input_chunk/log/test_buffer_valid.log
   )
 
 set(FLB_TESTS_DATA_PATH ${CMAKE_CURRENT_SOURCE_DIR}/)
@@ -47,22 +103,34 @@ endforeach()
 foreach(source_file ${UNIT_TESTS_FILES})
   get_filename_component(source_file_we ${source_file} NAME_WE)
   set(source_file_we flb-it-${source_file_we})
-  add_executable(
-    ${source_file_we}
-    ${source_file}
-    )
-
-  if(FLB_JEMALLOC)
-    target_link_libraries(${source_file_we} libjemalloc ${CMAKE_THREAD_LIBS_INIT})
+  if(FLB_WITHOUT_${source_file_we})
+    message("Skipping test ${source_file_we}")
   else()
-    target_link_libraries(${source_file_we} ${CMAKE_THREAD_LIBS_INIT})
-  endif()
+    add_executable(
+      ${source_file_we}
+      ${source_file}
+      )
+    add_sanitizers(${source_file_we})
 
-  target_link_libraries(${source_file_we} fluent-bit-static)
+    if(FLB_JEMALLOC)
+      target_link_libraries(${source_file_we} libjemalloc ${CMAKE_THREAD_LIBS_INIT})
+    else()
+      target_link_libraries(${source_file_we} ${CMAKE_THREAD_LIBS_INIT})
+    endif()
 
-  add_test(${source_file_we} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${source_file_we})
-  if("${CMAKE_C_COMPILER_ID}" STREQUAL "Clang" OR
-      "${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
-    set_property(TARGET ${source_file_we} APPEND_STRING PROPERTY COMPILE_FLAGS "-Wall -g -O3")
+    if(FLB_STREAM_PROCESSOR)
+      target_link_libraries(${source_file_we} flb-sp)
+    endif()
+
+    target_link_libraries(${source_file_we} fluent-bit-static)
+
+    add_test(NAME ${source_file_we}
+            COMMAND ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${source_file_we}
+            WORKING_DIRECTORY ${CMAKE_HOME_DIRECTORY}/build)
+    set_tests_properties(${source_file_we} PROPERTIES LABELS "internal")
   endif()
 endforeach()
+
+if(FLB_TESTS_INTERNAL_FUZZ)
+  add_subdirectory(fuzzers)
+endif()

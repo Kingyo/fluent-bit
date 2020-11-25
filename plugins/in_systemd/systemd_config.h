@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,10 +24,12 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
 #include <fluent-bit/flb_config.h>
+#include <fluent-bit/flb_sqldb.h>
 
 #include <systemd/sd-journal.h>
 
 /* return values */
+#define FLB_SYSTEMD_ERROR   -1 /* Systemd journal file read error. */
 #define FLB_SYSTEMD_NONE     0
 #define FLB_SYSTEMD_OK       1
 #define FLB_SYSTEMD_MORE     2
@@ -35,16 +38,18 @@
 /* constants */
 #define FLB_SYSTEMD_UNIT     "_SYSTEMD_UNIT"
 #define FLB_SYSTEMD_UNKNOWN  "unknown"
-#define FLB_SYSTEND_ENTRIES  5000
+#define FLB_SYSTEMD_MAX_FIELDS   8000
+#define FLB_SYSTEMD_MAX_ENTRIES  5000
 
 /* Input configuration & context */
 struct flb_systemd_config {
     /* Journal */
-    int fd;          /* Journal file descriptor */
-    sd_journal *j;   /* Journal context */
+    int fd;              /* Journal file descriptor */
+    sd_journal *j;       /* Journal context */
     char *cursor;
     char *path;
     int pending_records;
+    int read_from_tail;  /* read_from_tail option */
 
     /* Internal */
     int ch_manager[2];         /* pipe: channel manager    */
@@ -52,9 +57,16 @@ struct flb_systemd_config {
     int coll_fd_journal;       /* journal, events mode     */
     int coll_fd_pending;       /* pending records          */
     int dynamic_tag;
-    int max_entries;
+    int max_fields;            /* max number of fields per record */
+    int max_entries;           /* max number of records per iteration */
+    int strip_underscores;
+
+#ifdef FLB_HAVE_SQLDB
     struct flb_sqldb *db;
-    struct flb_input_instance *i_ins;
+    int db_sync;
+    sqlite3_stmt *stmt_cursor;
+#endif
+    struct flb_input_instance *ins;
 };
 
 struct flb_systemd_config *flb_systemd_config_create(struct flb_input_instance *i_ins,

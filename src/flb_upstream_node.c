@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,15 +26,16 @@
 #include <fluent-bit/flb_upstream_node.h>
 
 /* Create a new Upstream Node context */
-struct flb_upstream_node *flb_upstream_node_create(char *name, char *host,
-                                                   char *port,
+struct flb_upstream_node *flb_upstream_node_create(const char *name, const char *host,
+                                                   const char *port,
                                                    int tls, int tls_verify,
                                                    int tls_debug,
-                                                   char *tls_ca_path,
-                                                   char *tls_ca_file,
-                                                   char *tls_crt_file,
-                                                   char *tls_key_file,
-                                                   char *tls_key_passwd,
+                                                   const char *tls_vhost,
+                                                   const char *tls_ca_path,
+                                                   const char *tls_ca_file,
+                                                   const char *tls_crt_file,
+                                                   const char *tls_key_file,
+                                                   const char *tls_key_passwd,
                                                    struct flb_hash *ht,
                                                    struct flb_config *config)
 {
@@ -126,6 +128,7 @@ struct flb_upstream_node *flb_upstream_node_create(char *name, char *host,
     if (tls == FLB_TRUE) {
         node->tls.context = flb_tls_context_new(tls_verify,
                                                 tls_debug,
+                                                tls_vhost,
                                                 tls_ca_path,
                                                 tls_ca_file,
                                                 tls_crt_file,
@@ -163,12 +166,12 @@ struct flb_upstream_node *flb_upstream_node_create(char *name, char *host,
     return node;
 }
 
-char *flb_upstream_node_get_property(char *prop,
+const char *flb_upstream_node_get_property(const char *prop,
                                      struct flb_upstream_node *node)
 {
     int ret;
     int len;
-    char *value;
+    const char *value;
     size_t size;
 
     len = strlen(prop);

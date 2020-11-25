@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -54,12 +55,15 @@ struct flb_thread {
     void (*cb_destroy) (void *);
 };
 
+#ifdef FLB_CORO_STACK_SIZE
+#define FLB_THREAD_STACK_SIZE      FLB_CORO_STACK_SIZE
+#else
 #define FLB_THREAD_STACK_SIZE      ((3 * PTHREAD_STACK_MIN) / 2)
+#endif
+
 #define FLB_THREAD_DATA(th)        (((char *) th) + sizeof(struct flb_thread))
 
-FLB_EXPORT pthread_key_t flb_thread_key;
-
-static FLB_INLINE void flb_thread_prepare()
+static FLB_INLINE void flb_thread_prepare(void)
 {
     pthread_key_create(&flb_thread_key, NULL);
 }

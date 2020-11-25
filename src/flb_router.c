@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,21 +21,46 @@
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_mem.h>
 #include <fluent-bit/flb_str.h>
+#include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_chunk.h>
 #include <fluent-bit/flb_output.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_router.h>
+
+#ifdef FLB_HAVE_REGEX
+#include <onigmo.h>
+#endif
 
 #include <string.h>
 
 /* wildcard support */
 /* tag and match should be null terminated. */
-int flb_router_match(const char *tag, const char *match)
+static inline int router_match(const char *tag, int tag_len,
+                               const char *match,
+                               void *match_r)
 {
-    int ret = 0;
+    int ret = FLB_FALSE;
     char *pos = NULL;
 
-    while (1) {
+#ifdef FLB_HAVE_REGEX
+    struct flb_regex *match_regex = match_r;
+    int n;
+    if (match_regex) {
+        n = onig_match(match_regex->regex,
+                       (const unsigned char *) tag,
+                       (const unsigned char *) tag + tag_len,
+                       (const unsigned char *) tag, 0,
+                       ONIG_OPTION_NONE);
+        if (n > 0) {
+            return 1;
+        }
+    }
+#else
+    (void) match_r;
+#endif
+
+    while (match) {
         if (*match == '*') {
             while (*++match == '*'){
                 /* skip successive '*' */
@@ -45,9 +71,15 @@ int flb_router_match(const char *tag, const char *match)
                 break;
             }
 
-            /* FIXME: we need to avoid recursive calls here */
             while ((pos = strchr(tag, (int) *match))) {
-                if (flb_router_match(pos, match) ){
+#ifndef FLB_HAVE_REGEX
+                if (router_match(pos, tag_len, match, NULL)) {
+#else
+                /* We don't need to pass the regex recursively,
+                 * we matched in order above
+                 */
+                if (router_match(pos, tag_len, match, NULL)) {
+#endif
                     ret = 1;
                     break;
                 }
@@ -69,6 +101,12 @@ int flb_router_match(const char *tag, const char *match)
     }
 
     return ret;
+}
+
+int flb_router_match(const char *tag, int tag_len, const char *match,
+                     void *match_regex)
+{
+    return router_match(tag, tag_len, match, match_regex);
 }
 
 /* Associate and input and output instances due to a previous match */
@@ -117,10 +155,14 @@ int flb_router_io_set(struct flb_config *config)
                                     struct flb_input_instance, _head);
         o_ins = mk_list_entry_first(&config->outputs,
                                     struct flb_output_instance, _head);
-        if (!o_ins->match) {
+        if (!o_ins->match
+#ifdef FLB_HAVE_REGEX
+            && !o_ins->match_regex
+#endif
+            ) {
             flb_debug("[router] default match rule %s:%s",
                       i_ins->name, o_ins->name);
-            o_ins->match = flb_strdup("*");
+            o_ins->match = flb_sds_create_len("*", 1);
             flb_router_connect(i_ins, o_ins);
             return 0;
         }
@@ -130,16 +172,6 @@ int flb_router_io_set(struct flb_config *config)
     mk_list_foreach(i_head, &config->inputs) {
         i_ins = mk_list_entry(i_head, struct flb_input_instance, _head);
         if (!i_ins->p) {
-            continue;
-        }
-
-        /*
-         * Pre-routing rules cannot exists for a plugin which have dynamic
-         * tags.
-         */
-        if (i_ins->flags & FLB_INPUT_DYN_TAG) {
-            flb_debug("[router] input=%s 'DYNAMIC TAG'",
-                      i_ins->name);
             continue;
         }
 
@@ -154,13 +186,23 @@ int flb_router_io_set(struct flb_config *config)
         /* Try to find a match with output instances */
         mk_list_foreach(o_head, &config->outputs) {
             o_ins = mk_list_entry(o_head, struct flb_output_instance, _head);
-            if (!o_ins->match) {
+            if (!o_ins->match
+#ifdef FLB_HAVE_REGEX
+                && !o_ins->match_regex
+#endif
+                ) {
                 flb_warn("[router] NO match for %s output instance",
                           o_ins->name);
                 continue;
             }
 
-            if (flb_router_match(i_ins->tag, o_ins->match)) {
+            if (flb_router_match(i_ins->tag, i_ins->tag_len, o_ins->match
+#ifdef FLB_HAVE_REGEX
+                , o_ins->match_regex
+#else
+                , NULL
+#endif
+            )) {
                 flb_debug("[router] match rule %s:%s",
                           i_ins->name, o_ins->name);
                 flb_router_connect(i_ins, o_ins);
@@ -191,4 +233,57 @@ void flb_router_exit(struct flb_config *config)
             flb_free(r);
         }
     }
+}
+
+/*
+ * Calculate the routes_mask for input chunk with a router_match on tag
+ */
+uint64_t flb_router_get_routes_mask_by_tag(const char *tag, int tag_len,
+                                           struct flb_input_instance *in) {
+    uint64_t routes_mask = 0;
+    struct mk_list *o_head;
+    struct flb_output_instance *o_ins;
+    if (!in) {
+        return -1;
+    }
+
+    /* Find all matching routes for the given tag */
+    mk_list_foreach(o_head, &in->config->outputs) {
+        o_ins = mk_list_entry(o_head,
+                              struct flb_output_instance, _head);
+
+        if (flb_router_match(tag, tag_len, o_ins->match
+#ifdef FLB_HAVE_REGEX
+                             , o_ins->match_regex
+#else
+                             , NULL
+#endif
+                             )) {
+            /*
+             * mask_id for each output instance is a unique number starting from 1
+             * and multple by 2 each time. (e.g 1, 2 ,4 ,8, 16 ...)
+             * Let's take a look of the binary of the mask_id:
+             *   1:   00000001
+             *   2:   00000010
+             *   4:   00000100
+             *   8:   00001000
+             *   16:  00010000
+             * We can notice that each binary has only one 1's bit and this also
+             * represents the postion of the output instance. Getting the OR of 
+             * mask_id (given that tag is matched) will tell us the output instances 
+             * that the given input chunk will flush to.
+             * 
+             * For example: We have two matching output instances with mask_id 1 and 4
+             * There are two 1's in the binary with index 0 and 2 (starting from right)
+             * and this means that the input chunk will flush to first and third output
+             * instances configured in the Fluent Bit configuraion.
+             * 
+             *    0 |= 1 -> 00000 |= 00001 -> 00001
+             *    00001 |= 4 -> 00001 |= 00100 -> 00101
+             */
+            routes_mask |= o_ins->mask_id;
+        }
+    }
+
+    return routes_mask;
 }

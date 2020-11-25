@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,11 +22,12 @@
 #define FLB_OUT_INFLUXDB_H
 
 #include <fluent-bit/flb_output.h>
+#include <fluent-bit/flb_time.h>
 
 #define FLB_INFLUXDB_HOST "127.0.0.1"
 #define FLB_INFLUXDB_PORT 8086
 
-struct flb_influxdb_config {
+struct flb_influxdb {
     uint64_t seq;
 
     char uri[256];
@@ -50,6 +52,12 @@ struct flb_influxdb_config {
 
     /* Upstream connection to the backend server */
     struct flb_upstream *u;
+
+    /* used for incrementing identical timestamps */
+    struct flb_time ts_dupe;
+    struct flb_time ts_last;
+
+    struct flb_output_instance *ins;
 };
 
 #endif

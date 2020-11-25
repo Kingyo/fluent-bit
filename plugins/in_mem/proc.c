@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,10 +29,16 @@
 static char *human_readable_size(long size)
 {
     long u = 1024, i, len = 128;
-    char *buf = flb_malloc(len);
+    char *buf;
     static const char *__units[] = { "b", "K", "M", "G",
-        "T", "P", "E", "Z", "Y", NULL
+                                     "T", "P", "E", "Z", "Y", NULL
     };
+
+    buf = flb_malloc(len);
+    if (!buf) {
+        flb_errno();
+        return NULL;
+    }
 
     for (i = 0; __units[i] != NULL; i++) {
         if ((size / u) == 0) {
@@ -55,25 +62,23 @@ static char *file_to_buffer(const char *path)
 {
     FILE *fp;
     char *buffer;
-    long bytes;
 
     if (!(fp = fopen(path, "r"))) {
         flb_errno();
         return NULL;
     }
 
-    buffer = flb_malloc(PROC_STAT_BUF_SIZE);
+    buffer = flb_calloc(1, PROC_STAT_BUF_SIZE);
     if (!buffer) {
         fclose(fp);
         flb_errno();
         return NULL;
     }
 
-    bytes = fread(buffer, PROC_STAT_BUF_SIZE, 1, fp);
-    if (bytes < 0) {
+    fread(buffer, PROC_STAT_BUF_SIZE, 1, fp);
+    if (ferror(fp) || !feof(fp)) {
         flb_free(buffer);
         fclose(fp);
-        flb_errno();
         return NULL;
     }
 
@@ -99,6 +104,7 @@ struct proc_task *proc_stat(pid_t pid, int page_size)
     /* Compose path for /proc/PID/stat */
     ret = snprintf(pid_path, PROC_PID_SIZE, "/proc/%i/stat", pid);
     if (ret < 0) {
+        flb_free(t);
         flb_errno();
         return NULL;
     }
@@ -121,8 +127,17 @@ struct proc_task *proc_stat(pid_t pid, int page_size)
     }
     p++;
 
-    q = p;
-    while (*q != ')') q++;
+    /* seek from tail of file.  */
+    q = buf + (PROC_STAT_BUF_SIZE - 1);
+    while (*q != ')' && p < q) {
+        q--;
+    }
+    if (p >= q) {
+        flb_free(buf);
+        flb_free(t);
+        return NULL;
+    }
+
     strncpy(t->comm, p, q - p);
     q += 2;
 
@@ -154,6 +169,11 @@ struct proc_task *proc_stat(pid_t pid, int page_size)
     /* Internal conversion */
     t->proc_rss    = (t->rss * page_size);
     t->proc_rss_hr = human_readable_size(t->proc_rss);
+    if ( t->proc_rss_hr == NULL ) {
+        flb_free(buf);
+        flb_free(t);
+        return NULL;
+    }
 
     flb_free(buf);
     return t;

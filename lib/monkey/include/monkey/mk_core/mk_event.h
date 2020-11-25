@@ -74,6 +74,12 @@
     #include "mk_event_kqueue.h"
 #endif
 
+#if defined(_WIN32)
+    #define mk_event_closesocket(s) evutil_closesocket(s)
+#else
+    #define mk_event_closesocket(s) close(s)
+#endif
+
 /* Event reported by the event loop */
 struct mk_event {
     int      fd;       /* monitored file descriptor */
@@ -103,6 +109,11 @@ static inline void MK_EVENT_INIT(struct mk_event *ev, int fd, void *data,
     ev->status  = MK_EVENT_NONE;
     ev->data    = data;
     ev->handler = callback;
+}
+
+static inline void MK_EVENT_ZERO(struct mk_event *e)
+{
+    MK_EVENT_INIT(e, -1, NULL, NULL);
 }
 
 static inline void MK_EVENT_NEW(struct mk_event *e)

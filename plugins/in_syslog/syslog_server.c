@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +25,7 @@
 #include <fluent-bit/flb_network.h>
 
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -63,6 +65,14 @@ static int syslog_server_unix_create(struct flb_syslog *ctx)
         return -1;
     }
 
+    if (chmod(address.sun_path, ctx->unix_perm)) {
+        flb_errno();
+        flb_error("[in_syslog] cannot set permission on '%s' to %04o",
+                  address.sun_path, ctx->unix_perm);
+        close(fd);
+        return -1;
+    }
+
     if (ctx->mode == FLB_SYSLOG_UNIX_TCP) {
         if (listen(fd, 5) != 0) {
             flb_errno();
@@ -76,10 +86,13 @@ static int syslog_server_unix_create(struct flb_syslog *ctx)
 
 static int syslog_server_net_create(struct flb_syslog *ctx)
 {
-    if (ctx->mode == FLB_SYSLOG_TCP)
+    if (ctx->mode == FLB_SYSLOG_TCP) {
         ctx->server_fd = flb_net_server(ctx->port, ctx->listen);
-    else
+    }
+    else {
         ctx->server_fd = flb_net_server_udp(ctx->port, ctx->listen);
+    }
+
     if (ctx->server_fd > 0) {
         flb_info("[in_syslog] %s server binding %s:%s",
                  ((ctx->mode == FLB_SYSLOG_TCP) ? "TCP" : "UDP"),
@@ -100,10 +113,23 @@ int syslog_server_create(struct flb_syslog *ctx)
 {
     int ret;
 
+    if (ctx->mode == FLB_SYSLOG_UDP || ctx->mode == FLB_SYSLOG_UNIX_UDP) {
+        /* Create UDP buffer */
+        ctx->buffer_data = flb_calloc(1, ctx->buffer_chunk_size);
+        if (!ctx->buffer_data) {
+            flb_errno();
+            return -1;
+        }
+        ctx->buffer_size = ctx->buffer_chunk_size;
+        flb_info("[in_syslog] UDP buffer size set to %lu bytes",
+                 ctx->buffer_size);
+    }
+
     if (ctx->mode == FLB_SYSLOG_TCP || ctx->mode == FLB_SYSLOG_UDP) {
         ret = syslog_server_net_create(ctx);
     }
     else {
+        /* Create unix socket end-point */
         ret = syslog_server_unix_create(ctx);
     }
 
@@ -123,7 +149,6 @@ int syslog_server_destroy(struct flb_syslog *ctx)
         }
     }
     else {
-        flb_free(ctx->listen);
         flb_free(ctx->port);
     }
 

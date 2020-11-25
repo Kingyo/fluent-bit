@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,49 +23,36 @@
 
 #include <time.h>
 
-#include <monkey/mk_core.h>
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_pipe.h>
 #include <fluent-bit/flb_log.h>
+#include <fluent-bit/flb_sds.h>
 #include <fluent-bit/flb_task_map.h>
+
+#include <monkey/mk_core.h>
 
 #ifdef FLB_HAVE_TLS
 #include <fluent-bit/flb_io_tls.h>
 #endif
-
-#define FLB_FLUSH_UCONTEXT      0
-#define FLB_FLUSH_PTHREADS      1
-#define FLB_FLUSH_LIBCO         2
 
 #define FLB_CONFIG_FLUSH_SECS   5
 #define FLB_CONFIG_HTTP_LISTEN  "0.0.0.0"
 #define FLB_CONFIG_HTTP_PORT    "2020"
 #define FLB_CONFIG_DEFAULT_TAG  "fluent_bit"
 
-/* Property configuration: key/value for an input/output instance */
-struct flb_config_prop {
-    char *key;
-    char *val;
-    struct mk_list _head;
-};
-
 /* Main struct to hold the configuration of the runtime service */
 struct flb_config {
     struct mk_event ch_event;
 
     int support_mode;         /* enterprise support mode ?      */
+    int is_ingestion_active;  /* date ingestion active/allowed  */
     int is_running;           /* service running ?              */
-    int flush;                /* Flush timeout                  */
+    double flush;             /* Flush timeout                  */
+    int grace;                /* Grace on shutdown              */
     flb_pipefd_t flush_fd;    /* Timer FD associated to flush   */
-    int flush_method;         /* Flush method set at build time */
 
     int daemon;               /* Run as a daemon ?              */
     flb_pipefd_t shutdown_fd; /* Shutdown FD, 5 seconds         */
-
-#ifdef FLB_HAVE_STATS
-    int stats_fd;             /* Stats FD, 1 second             */
-    struct flb_stats *stats_ctx;
-#endif
 
     int verbose;           /* Verbose mode (default OFF)     */
     time_t init_time;      /* Time when Fluent Bit started   */
@@ -80,6 +68,8 @@ struct flb_config {
 
     struct mk_rconf *file;
 
+    flb_sds_t program_name;      /* argv[0] */
+
     /*
      * If a configuration file was used, this variable will contain the
      * absolute path for the directory that contains the file.
@@ -92,6 +82,9 @@ struct flb_config {
 
     /* Collectors */
     struct mk_list collectors;
+
+    /* Dynamic (dso) plugins context */
+    void *dso_plugins;
 
     /* Plugins references */
     struct mk_list in_plugins;
@@ -132,6 +125,9 @@ struct flb_config {
     /* Environment */
     void *env;
 
+    /* Exit status code */
+    int exit_status_code;
+
     /* Workers: threads spawn using flb_worker_create() */
     struct mk_list workers;
 
@@ -148,11 +144,16 @@ struct flb_config {
     void *http_ctx;           /* Monkey HTTP context    */
 #endif
 
-#ifdef FLB_HAVE_BUFFERING
-    struct flb_buffer *buffer_ctx;
-    int buffer_workers;
-    char *buffer_path;
-#endif
+    /* Chunk I/O Buffering */
+    void *cio;
+    char *storage_path;
+    void *storage_input_plugin;
+    char *storage_sync;             /* sync mode */
+    int   storage_metrics;          /* enable/disable storage metrics */
+    int   storage_checksum;         /* checksum enabled */
+    int   storage_max_chunks_up;    /* max number of chunks 'up' in memory */
+    char *storage_bl_mem_limit;     /* storage backlog memory limit */
+    struct flb_storage_metrics *storage_metrics_ctx; /* storage metrics context */
 
     /* Embedded SQL Database support (SQLite3) */
 #ifdef FLB_HAVE_SQLDB
@@ -163,6 +164,23 @@ struct flb_config {
 #ifdef FLB_HAVE_LUAJIT
     struct mk_list luajit_list;
 #endif
+
+#ifdef FLB_HAVE_STREAM_PROCESSOR
+    char *stream_processor_file;            /* SP configuration file */
+    void *stream_processor_ctx;             /* SP context */
+
+    /*
+     * Temporal list to hold tasks defined before the SP context is created
+     * by the engine. The list is passed upon start and destroyed.
+     */
+    struct mk_list stream_processor_tasks;
+#endif
+
+    /* Co-routines */
+    unsigned int coro_stack_size;
+
+    /* Upstream contexts created by plugins */
+    struct mk_list upstreams;
 
     /*
      * Input table-id: table to keep a reference of thread-IDs used by the
@@ -179,9 +197,16 @@ struct flb_config {
 
 struct flb_config *flb_config_init();
 void flb_config_exit(struct flb_config *config);
-char *flb_config_prop_get(char *key, struct mk_list *list);
+const char *flb_config_prop_get(const char *key, struct mk_list *list);
 int flb_config_set_property(struct flb_config *config,
-                            char *k, char *v);
+                            const char *k, const char *v);
+int flb_config_set_program_name(struct flb_config *config, char *name);
+
+int set_log_level_from_env(struct flb_config *config);
+#ifdef FLB_HAVE_STATIC_CONF
+struct mk_rconf *flb_config_static_open(const char *file);
+#endif
+
 struct flb_service_config {
     char    *key;
     int     type;
@@ -190,26 +215,37 @@ struct flb_service_config {
 
 enum conf_type {
     FLB_CONF_TYPE_INT,
+    FLB_CONF_TYPE_DOUBLE,
     FLB_CONF_TYPE_BOOL,
     FLB_CONF_TYPE_STR,
     FLB_CONF_TYPE_OTHER,
 };
 
-#define FLB_CONF_STR_FLUSH    "Flush"
-#define FLB_CONF_STR_DAEMON   "Daemon"
-#define FLB_CONF_STR_LOGFILE  "Log_File"
-#define FLB_CONF_STR_LOGLEVEL "Log_Level"
+#define FLB_CONF_STR_FLUSH        "Flush"
+#define FLB_CONF_STR_GRACE        "Grace"
+#define FLB_CONF_STR_DAEMON       "Daemon"
+#define FLB_CONF_STR_LOGFILE      "Log_File"
+#define FLB_CONF_STR_LOGLEVEL     "Log_Level"
 #define FLB_CONF_STR_PARSERS_FILE "Parsers_File"
 #define FLB_CONF_STR_PLUGINS_FILE "Plugins_File"
-#ifdef FLB_HAVE_HTTP_SERVER
-#define FLB_CONF_STR_HTTP_SERVER  "HTTP_Server"
-#define FLB_CONF_STR_HTTP_LISTEN  "HTTP_Listen"
-#define FLB_CONF_STR_HTTP_PORT    "HTTP_Port"
-#endif /* FLB_HAVE_HTTP_SERVER */
-#ifdef FLB_HAVE_BUFFERING
-#define FLB_CONF_STR_BUF_PATH     "Buffer_Path"
-#define FLB_CONF_STR_BUF_WORKERS  "Buffer_Workers"
-#endif /*FLB_HAVE_BUFFERING*/
+#define FLB_CONF_STR_STREAMS_FILE "Streams_File"
 
+/* FLB_HAVE_HTTP_SERVER */
+#ifdef FLB_HAVE_HTTP_SERVER
+#define FLB_CONF_STR_HTTP_SERVER     "HTTP_Server"
+#define FLB_CONF_STR_HTTP_LISTEN     "HTTP_Listen"
+#define FLB_CONF_STR_HTTP_PORT       "HTTP_Port"
+#endif /* !FLB_HAVE_HTTP_SERVER */
+
+/* Storage / Chunk I/O */
+#define FLB_CONF_STORAGE_PATH          "storage.path"
+#define FLB_CONF_STORAGE_SYNC          "storage.sync"
+#define FLB_CONF_STORAGE_METRICS       "storage.metrics"
+#define FLB_CONF_STORAGE_CHECKSUM      "storage.checksum"
+#define FLB_CONF_STORAGE_BL_MEM_LIMIT  "storage.backlog.mem_limit"
+#define FLB_CONF_STORAGE_MAX_CHUNKS_UP "storage.max_chunks_up"
+
+/* Coroutines */
+#define FLB_CONF_STR_CORO_STACK_SIZE "Coro_Stack_Size"
 
 #endif

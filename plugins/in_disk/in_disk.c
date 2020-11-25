@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +20,7 @@
 
 #include <fluent-bit/flb_info.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_error.h>
 #include <fluent-bit/flb_str.h>
@@ -32,13 +34,16 @@
 
 #include "in_disk.h"
 
-static char* shift_line(const char *line, char separator, int *idx,
+#define LINE_SIZE 256
+#define BUF_SIZE  32
+
+static char *shift_line(const char *line, char separator, int *idx,
                         char *buf, int buf_size)
 {
     char pack_mode = FLB_FALSE;
     int  idx_buf = 0;
 
-    while(1) {
+    while (1) {
         if (line[*idx] == '\0') {
             /* end of line */
             return NULL;
@@ -61,9 +66,6 @@ static char* shift_line(const char *line, char separator, int *idx,
     }
 }
 
-
-#define LINE_SIZE 256
-#define BUF_SIZE  32
 static int update_disk_stats(struct flb_in_disk_config *ctx)
 {
     char line[LINE_SIZE] = {0};
@@ -77,16 +79,16 @@ static int update_disk_stats(struct flb_in_disk_config *ctx)
 
     fp = fopen("/proc/diskstats", "r");
     if (fp == NULL) {
-        perror("fopen");
+        flb_errno();
         return -1;
     }
 
-    while(fgets(line, LINE_SIZE-1, fp) != NULL) {
+    while (fgets(line, LINE_SIZE-1, fp) != NULL) {
         i_line = 0;
         i_field = 0;
         skip_line = FLB_FALSE;
-        while(skip_line != FLB_TRUE &&
-              shift_line(line, ' ', &i_line, buf, BUF_SIZE-1) != NULL) {
+        while (skip_line != FLB_TRUE &&
+               shift_line(line, ' ', &i_line, buf, BUF_SIZE-1) != NULL) {
             i_field++;
             switch(i_field) {
             case 3: /* device name */
@@ -125,6 +127,8 @@ static int in_disk_collect(struct flb_input_instance *i_ins,
     struct flb_in_disk_config *ctx = in_context;
     (void) *i_ins;
     (void) *config;
+    msgpack_packer mp_pck;
+    msgpack_sbuffer mp_sbuf;
 
     /* The type of sector size is unsigned long in kernel source */
     unsigned long   read_total = 0;
@@ -136,11 +140,11 @@ static int in_disk_collect(struct flb_input_instance *i_ins,
 
     update_disk_stats(ctx);
 
-    if ( ctx->first_snapshot == FLB_TRUE ){
+    if (ctx->first_snapshot == FLB_TRUE) {
         ctx->first_snapshot = FLB_FALSE;    /* assign first_snapshot with FLB_FALSE */
     }
     else {
-        for (i=0; i<entry; i++) {
+        for (i = 0; i < entry; i++) {
             if (ctx->read_total[i] >= ctx->prev_read_total[i]) {
                 read_total += ctx->read_total[i] - ctx->prev_read_total[i];
             }
@@ -163,23 +167,26 @@ static int in_disk_collect(struct flb_input_instance *i_ins,
         read_total  *= 512;
         write_total *= 512;
 
-        /* Mark the start of a 'buffer write' operation */
-        flb_input_buf_write_start(i_ins);
+        /* Initialize local msgpack buffer */
+        msgpack_sbuffer_init(&mp_sbuf);
+        msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
-        msgpack_pack_array(&i_ins->mp_pck, 2);
-        flb_pack_time_now(&i_ins->mp_pck);
-        msgpack_pack_map(&i_ins->mp_pck, num_map);
+        /* Pack data */
+        msgpack_pack_array(&mp_pck, 2);
+        flb_pack_time_now(&mp_pck);
+        msgpack_pack_map(&mp_pck, num_map);
 
 
-        msgpack_pack_str(&i_ins->mp_pck, strlen(STR_KEY_READ));
-        msgpack_pack_str_body(&i_ins->mp_pck, STR_KEY_READ, strlen(STR_KEY_READ));
-        msgpack_pack_uint64(&i_ins->mp_pck, read_total);
+        msgpack_pack_str(&mp_pck, strlen(STR_KEY_READ));
+        msgpack_pack_str_body(&mp_pck, STR_KEY_READ, strlen(STR_KEY_READ));
+        msgpack_pack_uint64(&mp_pck, read_total);
 
-        msgpack_pack_str(&i_ins->mp_pck, strlen(STR_KEY_WRITE));
-        msgpack_pack_str_body(&i_ins->mp_pck, STR_KEY_WRITE, strlen(STR_KEY_WRITE));
-        msgpack_pack_uint64(&i_ins->mp_pck, write_total);
+        msgpack_pack_str(&mp_pck, strlen(STR_KEY_WRITE));
+        msgpack_pack_str_body(&mp_pck, STR_KEY_WRITE, strlen(STR_KEY_WRITE));
+        msgpack_pack_uint64(&mp_pck, write_total);
 
-        flb_input_buf_write_end(i_ins);
+        flb_input_chunk_append_raw(i_ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
+        msgpack_sbuffer_destroy(&mp_sbuf);
     }
 
     return 0;
@@ -205,10 +212,10 @@ static int get_diskstats_entries(void)
 }
 
 static int configure(struct flb_in_disk_config *disk_config,
-                               struct flb_input_instance *in)
+                     struct flb_input_instance *in)
 {
     (void) *in;
-    char *pval = NULL;
+    const char *pval = NULL;
     int entry = 0;
     int i;
 
@@ -255,6 +262,14 @@ static int configure(struct flb_in_disk_config *disk_config,
     disk_config->prev_write_total = (uint64_t*)flb_malloc(sizeof(uint64_t)*entry);
     disk_config->entry = entry;
 
+    if ( disk_config->read_total       == NULL ||
+         disk_config->write_total      == NULL ||
+         disk_config->prev_read_total  == NULL ||
+         disk_config->prev_write_total == NULL) {
+        flb_plg_error(in, "could not allocate memory");
+        return -1;
+    }
+
     /* initialize */
     for (i=0; i<entry; i++) {
         disk_config->read_total[i] = 0;
@@ -299,7 +314,7 @@ static int in_disk_init(struct flb_input_instance *in,
                                        disk_config->interval_sec,
                                        disk_config->interval_nsec, config);
     if (ret < 0) {
-        flb_error("could not set collector for disk input plugin");
+        flb_plg_error(in, "could not set collector for disk input plugin");
         goto init_error;
     }
 

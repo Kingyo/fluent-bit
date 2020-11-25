@@ -2,6 +2,7 @@
 
 /*  Fluent Bit
  *  ==========
+ *  Copyright (C) 2019-2020 The Fluent Bit Authors
  *  Copyright (C) 2015-2018 Treasure Data Inc.
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,8 +19,9 @@
  */
 
 #include <fluent-bit/flb_info.h>
-#include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_input.h>
+#include <fluent-bit/flb_input_plugin.h>
+#include <fluent-bit/flb_io.h>
 #include <fluent-bit/flb_config.h>
 #include <fluent-bit/flb_upstream.h>
 #include <fluent-bit/flb_pack.h>
@@ -52,16 +54,21 @@ struct flb_in_health_config {
 
     /* Networking */
     struct flb_upstream *u;
+
+    /* Plugin instance */
+    struct flb_input_instance *ins;
 };
 
 /* Collection aims to try to connect to the specified TCP server */
-static int in_health_collect(struct flb_input_instance *i_ins,
+static int in_health_collect(struct flb_input_instance *ins,
                              struct flb_config *config, void *in_context)
 {
+    int map_num = 1;
     uint8_t alive;
     struct flb_in_health_config *ctx = in_context;
     struct flb_upstream_conn *u_conn;
-    int map_num = 1;
+    msgpack_packer mp_pck;
+    msgpack_sbuffer mp_sbuf;
 
     u_conn = flb_upstream_conn_get(ctx->u);
     if (!u_conn) {
@@ -76,15 +83,13 @@ static int in_health_collect(struct flb_input_instance *i_ins,
         FLB_INPUT_RETURN();
     }
 
-    /*
-     * Store the new data into the MessagePack buffer,
-     */
+    /* Initialize local msgpack buffer */
+    msgpack_sbuffer_init(&mp_sbuf);
+    msgpack_packer_init(&mp_pck, &mp_sbuf, msgpack_sbuffer_write);
 
-    /* Mark the start of a 'buffer write' operation */
-    flb_input_buf_write_start(i_ins);
-
-    msgpack_pack_array(&i_ins->mp_pck, 2);
-    flb_pack_time_now(&i_ins->mp_pck);
+    /* Pack data */
+    msgpack_pack_array(&mp_pck, 2);
+    flb_pack_time_now(&mp_pck);
 
     /* extract map field */
     if (ctx->add_host) {
@@ -93,35 +98,36 @@ static int in_health_collect(struct flb_input_instance *i_ins,
     if (ctx->add_port) {
         map_num++;
     }
-    msgpack_pack_map(&i_ins->mp_pck, map_num);
+    msgpack_pack_map(&mp_pck, map_num);
 
     /* Status */
-    msgpack_pack_str(&i_ins->mp_pck, 5);
-    msgpack_pack_str_body(&i_ins->mp_pck, "alive", 5);
+    msgpack_pack_str(&mp_pck, 5);
+    msgpack_pack_str_body(&mp_pck, "alive", 5);
 
     if (alive) {
-        msgpack_pack_true(&i_ins->mp_pck);
+        msgpack_pack_true(&mp_pck);
     }
     else {
-        msgpack_pack_false(&i_ins->mp_pck);
+        msgpack_pack_false(&mp_pck);
     }
 
     if (ctx->add_host) {
         /* append hostname */
-        msgpack_pack_str(&i_ins->mp_pck, strlen("hostname"));
-        msgpack_pack_str_body(&i_ins->mp_pck, "hostname", strlen("hostname"));
-        msgpack_pack_str(&i_ins->mp_pck, ctx->len_host);
-        msgpack_pack_str_body(&i_ins->mp_pck, ctx->hostname, ctx->len_host);
+        msgpack_pack_str(&mp_pck, strlen("hostname"));
+        msgpack_pack_str_body(&mp_pck, "hostname", strlen("hostname"));
+        msgpack_pack_str(&mp_pck, ctx->len_host);
+        msgpack_pack_str_body(&mp_pck, ctx->hostname, ctx->len_host);
     }
 
     if (ctx->add_port) {
         /* append port number */
-        msgpack_pack_str(&i_ins->mp_pck, strlen("port"));
-        msgpack_pack_str_body(&i_ins->mp_pck, "port", strlen("port"));
-        msgpack_pack_int32(&i_ins->mp_pck, ctx->port);
+        msgpack_pack_str(&mp_pck, strlen("port"));
+        msgpack_pack_str_body(&mp_pck, "port", strlen("port"));
+        msgpack_pack_int32(&mp_pck, ctx->port);
     }
 
-    flb_input_buf_write_end(i_ins);
+    flb_input_chunk_append_raw(ins, NULL, 0, mp_sbuf.data, mp_sbuf.size);
+    msgpack_sbuffer_destroy(&mp_sbuf);
 
     FLB_INPUT_RETURN();
     return 0;
@@ -131,34 +137,34 @@ static int in_health_init(struct flb_input_instance *in,
                           struct flb_config *config, void *data)
 {
     int ret;
-    char *pval;
+    const char *pval;
     struct flb_in_health_config *ctx;
     (void) data;
 
     if (in->host.name == NULL) {
-        flb_error("[in_health] no input 'Host' is given");
+        flb_plg_error(in, "no input 'Host' provided");
         return -1;
     }
 
     /* Allocate space for the configuration */
     ctx = flb_calloc(1, sizeof(struct flb_in_health_config));
     if (!ctx) {
-        perror("calloc");
+        flb_errno();
         return -1;
     }
     ctx->alert = FLB_FALSE;
     ctx->add_host = FLB_FALSE;
     ctx->len_host = 0;
     ctx->hostname = NULL;
-
     ctx->add_port = FLB_FALSE;
     ctx->port     = -1;
+    ctx->ins      = in;
 
     ctx->u = flb_upstream_create(config, in->host.name, in->host.port,
                                  FLB_IO_TCP, NULL);
     if (!ctx->u) {
+        flb_plg_error(ctx->ins, "could not initialize upstream");
         flb_free(ctx);
-        flb_error("[in_health] could not initialize upstream");
         return -1;
     }
 
@@ -219,7 +225,7 @@ static int in_health_init(struct flb_input_instance *in,
                                        ctx->interval_nsec,
                                        config);
     if (ret == -1) {
-        flb_error("Could not set collector for Health input plugin");
+        flb_plg_error(ctx->ins, "could not set collector for Health input plugin");
         flb_free(ctx);
         return -1;
     }
@@ -227,7 +233,7 @@ static int in_health_init(struct flb_input_instance *in,
     return 0;
 }
 
-int in_health_exit(void *data, struct flb_config *config)
+static int in_health_exit(void *data, struct flb_config *config)
 {
     (void) *config;
     struct flb_in_health_config *ctx = data;
